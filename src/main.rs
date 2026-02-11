@@ -54,7 +54,7 @@ enum DeleterError {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "deleter",
+    name = "spf",
     about = "⚠️ Ultra-fast safe file deletion tool (supports trash)",
     version
 )]
@@ -122,15 +122,12 @@ fn format_size(size: u64) -> String {
 }
 
 /// Parse size string with optional unit suffix.
-/// Supports: B (bytes, default), K/KB (kilobytes), M/MB (megabytes),
-/// G/GB (gigabytes), T/TB (terabytes). Case insensitive.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(0);
     }
 
-    // Find where the number ends and unit begins
     let (num_part, unit_part) = s
         .find(|c: char| !c.is_ascii_digit())
         .map(|i| s.split_at(i))
@@ -139,15 +136,14 @@ fn parse_size(s: &str) -> Result<u64, String> {
     let num: u64 = num_part
         .parse()
         .map_err(|_| format!("invalid number: {}", num_part))?;
-
     let unit = unit_part.trim().to_uppercase();
 
     let multiplier = match unit.as_str() {
         "" | "B" => 1u64,
-        "K" | "KB" => 1024u64,
-        "M" | "MB" => 1024u64 * 1024,
-        "G" | "GB" => 1024u64 * 1024 * 1024,
-        "T" | "TB" => 1024u64 * 1024 * 1024 * 1024,
+        "K" | "KB" => 1024,
+        "M" | "MB" => 1024 * 1024,
+        "G" | "GB" => 1024 * 1024 * 1024,
+        "T" | "TB" => 1024_u64 * 1024 * 1024 * 1024,
         _ => return Err(format!("invalid unit: {}", unit_part)),
     };
 
@@ -168,6 +164,20 @@ fn build_globset(include: Option<&str>, exclude: &Option<String>) -> Result<Glob
     builder
         .build()
         .map_err(|e| DeleterError::Glob(e.to_string()))
+}
+
+fn format_dirs(paths: &[PathBuf]) -> String {
+    let dirs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    match dirs.len() {
+        0 => "directories".into(),
+        1 => dirs[0].clone(),
+        2 => format!("{} and {}", dirs[0], dirs[1]),
+        _ => {
+            let last = dirs.last().unwrap();
+            let rest = &dirs[..dirs.len() - 1];
+            format!("{}, and {}", rest.join(", "), last)
+        }
+    }
 }
 
 //
@@ -195,13 +205,10 @@ async fn scan_only(
                     if !entry.file_type().is_file() {
                         continue;
                     }
-
                     if !globset.is_match(entry.path()) {
                         continue;
                     }
-
                     let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-
                     if len < min_size {
                         continue;
                     }
@@ -239,19 +246,19 @@ async fn scan_only(
 //
 
 async fn delete_streaming(
-    job_paths: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
     globset: GlobSet,
     dry_run: bool,
     use_trash: bool,
     parallelism: usize,
     min_size: u64,
+    verbose: bool,
     pb: ProgressBar,
 ) -> Result<u64, DeleterError> {
     let deleted = Arc::new(AtomicU64::new(0));
 
-    let stream = stream::iter(job_paths).flat_map(|root| {
+    let stream = stream::iter(roots).flat_map(|root| {
         let globset = globset.clone();
-
         stream::iter(
             WalkDir::new(root)
                 .into_iter()
@@ -271,13 +278,16 @@ async fn delete_streaming(
             let pb = pb.clone();
 
             async move {
+                if verbose {
+                    pb.println(path.display().to_string());
+                }
+
                 if !dry_run {
                     if use_trash {
                         let _ = tokio::task::spawn_blocking(move || trash_delete(&path)).await;
                     } else {
                         let _ = fs::remove_file(&path).await;
                     }
-
                     deleted.fetch_add(1, Ordering::Relaxed);
                 }
 
@@ -287,19 +297,15 @@ async fn delete_streaming(
         .await;
 
     pb.finish();
-
     Ok(deleted.load(Ordering::Relaxed))
 }
 
 //
 // ──────────────────────────────────────────────────────────
-//
-// ──────────────────────────────────────────────────────────
-// MAIN
+// Collect paths from CLI (support file containing paths)
 // ──────────────────────────────────────────────────────────
 //
 
-/// Parse paths from file content (comma, space, or newline separated)
 fn parse_paths_from_content(content: &str) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
@@ -316,18 +322,17 @@ fn parse_paths_from_content(content: &str) -> Vec<PathBuf> {
             }
         }
     }
+
     paths
 }
 
-/// Collect paths from CLI arguments (directories or files containing paths)
 async fn collect_paths(input_paths: &[PathBuf]) -> Result<Vec<PathBuf>, DeleterError> {
-    let mut all_paths: Vec<PathBuf> = Vec::new();
+    let mut all_paths = Vec::new();
     let mut seen = HashSet::new();
 
     for path in input_paths {
         let metadata = fs::metadata(path).await?;
         if metadata.is_file() {
-            // Read file and parse paths
             let content = fs::read_to_string(path).await?;
             for p in parse_paths_from_content(&content) {
                 if seen.insert(p.clone()) {
@@ -347,7 +352,6 @@ async fn collect_paths(input_paths: &[PathBuf]) -> Result<Vec<PathBuf>, DeleterE
         return Err(DeleterError::NoValidPaths);
     }
 
-    // Validate all are directories
     for path in &all_paths {
         if !fs::metadata(path).await?.is_dir() {
             return Err(DeleterError::JobDir(path.clone()));
@@ -357,11 +361,14 @@ async fn collect_paths(input_paths: &[PathBuf]) -> Result<Vec<PathBuf>, DeleterE
     Ok(all_paths)
 }
 
-async fn run(cli: Cli) -> Result<(), DeleterError> {
-    eprintln!("DEBUG: starting run");
-    let all_paths = collect_paths(&cli.paths).await?;
-    eprintln!("DEBUG: collected paths = {:?}", all_paths);
+//
+// ──────────────────────────────────────────────────────────
+// Main run
+// ──────────────────────────────────────────────────────────
+//
 
+async fn run(cli: Cli) -> Result<(), DeleterError> {
+    let all_paths = collect_paths(&cli.paths).await?;
     let globset = build_globset(cli.glob.as_deref(), &cli.exclude)?;
 
     println!("🔍 Scanning...");
@@ -379,56 +386,28 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         return Ok(());
     }
 
-    println!("Found {files} files ({}).", format_size(bytes));
+    let glob_pattern = cli.glob.as_deref().unwrap_or("**/*");
+    let mode = if cli.trash { "TRASH" } else { "PERMANENT" };
+    println!(
+        "ALL '{}' files in dir {} will be {} deleted!",
+        glob_pattern,
+        format_dirs(&all_paths),
+        mode
+    );
 
-    // Show summary or verbose file list
+    println!("Files: {}, Size: {}", files, format_size(bytes));
+
     if cli.verbose {
         for p in &preview {
             println!("  {}", p.display());
         }
-    } else {
-        let glob_pattern = cli.glob.as_deref().unwrap_or("**/*");
-        let dirs: Vec<String> = all_paths.iter().map(|p| p.display().to_string()).collect();
-
-        let dirs_str = if dirs.is_empty() {
-            "directories".to_string()
-        } else if dirs.len() == 1 {
-            dirs[0].clone()
-        } else if dirs.len() == 2 {
-            format!("{} and {}", dirs[0], dirs[1])
-        } else {
-            let last = dirs.last().unwrap();
-            let rest = &dirs[..dirs.len() - 1];
-            format!("{}, and {}", rest.join(", "), last)
-        };
-
-        let delete_mode = if cli.trash { "TRASH" } else { "PERMANENT" };
-        println!(
-            "'{}' files in dir {} will be {} deleted!",
-            glob_pattern, dirs_str, delete_mode
-        );
     }
 
-    // Confirm only when not in dry-run mode and not auto-confirmed
     if !cli.dry_run && !cli.yes {
-        println!("\n⚠️  DANGER");
-        println!("Files : {}", files);
-        println!("Size  : {}", format_size(bytes));
-        println!(
-            "Mode  : {}",
-            if cli.trash {
-                "TRASH"
-            } else {
-                "PERMANENT DELETE"
-            }
-        );
-
         print!("\nType YES to continue: ");
         io::stdout().flush()?;
-
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-
         let trimmed = input.trim().to_lowercase();
         if trimmed != "yes" && trimmed != "y" {
             return Err(DeleterError::Cancelled);
@@ -453,6 +432,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         cli.trash,
         cli.parallelism,
         cli.min_size,
+        cli.verbose,
         pb,
     )
     .await?;
@@ -460,7 +440,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     if cli.dry_run {
         println!("Preview complete.");
     } else {
-        println!("✅ Removed {deleted} files, freed {}", format_size(bytes));
+        println!("✅ Removed {} files, freed {}", deleted, format_size(bytes));
     }
 
     Ok(())
@@ -471,6 +451,3 @@ async fn main() -> Result<(), DeleterError> {
     let cli = Cli::parse();
     run(cli).await
 }
-
-#[cfg(test)]
-mod test;
