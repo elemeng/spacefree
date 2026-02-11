@@ -1,7 +1,16 @@
 [package]
 name = "spacefree"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
+authors = ["elemeng"]
+description = "high-performance file deletion tool with trash support"
+readme = "README.md"
+homepage = "https://github.com/elemeng/spacefree"
+repository = "https://github.com/elemeng/spacefree"
+license = "MIT"
+keywords = ["cli", "delete", "trash", "cleanup", "files"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -13,3 +22,14 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["fs", "rt-multi-thread", "macros"] }
 trash = "5.2"
 walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[[bin]]
+name = "spacefree"
+path = "src/main.rs"
+
+[[bin]]
+name = "spa"
+path = "src/main.rs"
