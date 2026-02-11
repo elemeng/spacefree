@@ -55,7 +55,7 @@ enum DeleterError {
 #[derive(Parser, Debug)]
 #[command(
     name = "spf",
-    about = "⚠️ Ultra-fast safe file deletion tool (supports trash)",
+    about = "🚀 Ultra-fast file deletion CLI tool (supports trash)",
     version
 )]
 struct Cli {
@@ -151,17 +151,26 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| "size overflow".to_string())
 }
 
-fn build_globset(include: Option<&str>, exclude: &Option<String>) -> Result<(GlobSet, Option<globset::GlobMatcher>), DeleterError> {
+fn build_globset(
+    include: Option<&str>,
+    exclude: &Option<String>,
+) -> Result<(GlobSet, Option<globset::GlobMatcher>), DeleterError> {
     let mut builder = GlobSetBuilder::new();
 
     let pattern = include.unwrap_or("**/*");
     builder.add(Glob::new(pattern).map_err(|e| DeleterError::Glob(e.to_string()))?);
 
-    let globset = builder.build().map_err(|e| DeleterError::Glob(e.to_string()))?;
+    let globset = builder
+        .build()
+        .map_err(|e| DeleterError::Glob(e.to_string()))?;
 
     let exclude_matcher = exclude
         .as_ref()
-        .map(|ex| Glob::new(ex).map_err(|e| DeleterError::Glob(e.to_string())).map(|g| g.compile_matcher()))
+        .map(|ex| {
+            Glob::new(ex)
+                .map_err(|e| DeleterError::Glob(e.to_string()))
+                .map(|g| g.compile_matcher())
+        })
         .transpose()?;
 
     Ok((globset, exclude_matcher))
@@ -183,6 +192,19 @@ fn format_dirs(paths: &[PathBuf]) -> String {
 
 //
 // ──────────────────────────────────────────────────────────
+// Config structs
+// ──────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct DeleteConfig {
+    use_trash: bool,
+    dry_run: bool,
+    parallelism: usize,
+    min_size: u64,
+    verbose: bool,
+}
+
+// ──────────────────────────────────────────────────────────
 // Scan phase
 // ──────────────────────────────────────────────────────────
 //
@@ -191,13 +213,13 @@ async fn scan_only(
     job_paths: Vec<PathBuf>,
     globset: GlobSet,
     exclude_glob: Option<globset::GlobMatcher>,
-    min_size: u64,
-    parallelism: usize,
+    config: &DeleteConfig,
 ) -> Result<(u64, u64, Vec<PathBuf>), DeleterError> {
     let results = stream::iter(job_paths)
         .map(|root| {
             let globset = globset.clone();
             let exclude_glob = exclude_glob.clone();
+            let min_size = config.min_size;
 
             tokio::task::spawn_blocking(move || {
                 let mut files = 0;
@@ -229,7 +251,7 @@ async fn scan_only(
                 (files, bytes, file_list)
             })
         })
-        .buffer_unordered(parallelism)
+        .buffer_unordered(config.parallelism)
         .collect::<Vec<_>>()
         .await;
 
@@ -257,11 +279,7 @@ async fn delete_streaming(
     roots: Vec<PathBuf>,
     globset: GlobSet,
     exclude_glob: Option<globset::GlobMatcher>,
-    dry_run: bool,
-    use_trash: bool,
-    parallelism: usize,
-    min_size: u64,
-    verbose: bool,
+    config: DeleteConfig,
     pb: ProgressBar,
 ) -> Result<u64, DeleterError> {
     let deleted = Arc::new(AtomicU64::new(0));
@@ -269,6 +287,7 @@ async fn delete_streaming(
     let stream = stream::iter(roots).flat_map(|root| {
         let globset = globset.clone();
         let exclude_glob = exclude_glob.clone();
+        let min_size = config.min_size;
         stream::iter(
             WalkDir::new(root)
                 .into_iter()
@@ -292,17 +311,18 @@ async fn delete_streaming(
     });
 
     stream
-        .for_each_concurrent(parallelism, |path| {
+        .for_each_concurrent(config.parallelism, |path| {
             let deleted = deleted.clone();
             let pb = pb.clone();
+            let config = config.clone();
 
             async move {
-                if verbose {
+                if config.verbose {
                     pb.println(path.display().to_string());
                 }
 
-                if !dry_run {
-                    if use_trash {
+                if !config.dry_run {
+                    if config.use_trash {
                         let _ = tokio::task::spawn_blocking(move || trash_delete(&path)).await;
                     } else {
                         let _ = fs::remove_file(&path).await;
@@ -392,12 +412,19 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     println!("🔍 Scanning...");
 
+    let config = DeleteConfig {
+        use_trash: cli.trash,
+        dry_run: cli.dry_run,
+        parallelism: cli.parallelism,
+        min_size: cli.min_size,
+        verbose: cli.verbose,
+    };
+
     let (files, bytes, preview) = scan_only(
         all_paths.clone(),
         globset.clone(),
         exclude_glob.clone(),
-        cli.min_size,
-        cli.parallelism,
+        &config,
     )
     .await?;
 
@@ -424,7 +451,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     }
 
     if !cli.dry_run && !cli.yes {
-        print!("\nType YES to continue: ");
+        print!("\nType YES/Yes/yes/Y/y to continue: ");
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
@@ -445,18 +472,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     println!("🗑️  Processing...");
 
-    let deleted = delete_streaming(
-        all_paths,
-        globset,
-        exclude_glob,
-        cli.dry_run,
-        cli.trash,
-        cli.parallelism,
-        cli.min_size,
-        cli.verbose,
-        pb,
-    )
-    .await?;
+    let deleted = delete_streaming(all_paths, globset, exclude_glob, config, pb).await?;
 
     if cli.dry_run {
         println!("Preview complete.");

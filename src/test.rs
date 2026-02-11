@@ -234,10 +234,20 @@ fn test_cli_parse_all_options() {
 // ========== Async function tests ==========
 #[tokio::test]
 async fn test_scan_only_empty_dir() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
+    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -248,6 +258,8 @@ async fn test_scan_only_empty_dir() {
 
 #[tokio::test]
 async fn test_scan_only_with_files() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     // Create test files
@@ -263,7 +275,15 @@ async fn test_scan_only_with_files() {
 
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
+    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -274,6 +294,8 @@ async fn test_scan_only_with_files() {
 
 #[tokio::test]
 async fn test_scan_only_with_min_size() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     fs::write(temp.path().join("small.txt"), "hi")
@@ -285,21 +307,25 @@ async fn test_scan_only_with_min_size() {
 
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, _bytes, _) = scan_only(
-        vec![temp.path().to_path_buf()],
-        gs,
-        exclude,
-        10, // min_size
-        4,
-    )
-    .await
-    .unwrap();
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 10,
+        verbose: false,
+    };
+
+    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+        .await
+        .unwrap();
 
     assert_eq!(files, 1); // only large.txt
 }
 
 #[tokio::test]
 async fn test_scan_only_multiple_dirs() {
+    use super::DeleteConfig;
+
     let temp1 = TempDir::new().unwrap();
     let temp2 = TempDir::new().unwrap();
 
@@ -308,12 +334,19 @@ async fn test_scan_only_multiple_dirs() {
 
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
     let (files, bytes, _) = scan_only(
         vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()],
         gs,
         exclude,
-        0,
-        4,
+        &config,
     )
     .await
     .unwrap();
@@ -324,6 +357,8 @@ async fn test_scan_only_multiple_dirs() {
 
 #[tokio::test]
 async fn test_delete_streaming_dry_run() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     fs::write(temp.path().join("file.txt"), "content")
@@ -333,15 +368,19 @@ async fn test_delete_streaming_dry_run() {
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: true,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
     let deleted = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
         exclude,
-        true, // dry_run
-        false,
-        4,
-        0,
-        false,
+        config,
         pb,
     )
     .await
@@ -356,6 +395,8 @@ async fn test_delete_streaming_dry_run() {
 
 #[tokio::test]
 async fn test_delete_streaming_actual_delete() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     fs::write(temp.path().join("file.txt"), "content")
@@ -365,15 +406,19 @@ async fn test_delete_streaming_actual_delete() {
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
     let deleted = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
         exclude,
-        false, // actual delete
-        false,
-        4,
-        0,
-        false,
+        config,
         pb,
     )
     .await
@@ -385,6 +430,8 @@ async fn test_delete_streaming_actual_delete() {
 
 #[tokio::test]
 async fn test_delete_streaming_with_min_size() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     fs::write(temp.path().join("small.txt"), "x").await.unwrap();
@@ -395,15 +442,19 @@ async fn test_delete_streaming_with_min_size() {
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 5,
+        verbose: false,
+    };
+
     let deleted = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
         exclude,
-        false,
-        false,
-        4,
-        5, // min_size
-        false,
+        config,
         pb,
     )
     .await
@@ -508,6 +559,8 @@ async fn test_collect_paths_mixed_dirs_and_files() {
 // ========== scan_only all files tests ==========
 #[tokio::test]
 async fn test_scan_only_returns_all_files() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     // Create more than 10 files
@@ -519,7 +572,15 @@ async fn test_scan_only_returns_all_files() {
 
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, _bytes, all_files) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
+    let (files, _bytes, all_files) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -539,6 +600,8 @@ fn test_build_globset_exclude_matches() {
 
 #[tokio::test]
 async fn test_scan_only_with_glob_pattern() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     fs::write(temp.path().join("file.txt"), "content")
@@ -553,7 +616,15 @@ async fn test_scan_only_with_glob_pattern() {
 
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
+    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -766,6 +837,8 @@ async fn test_collect_paths_nested_dir_validation() {
 
 #[tokio::test]
 async fn test_scan_only_nested_dirs() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
 
     // Create nested structure
@@ -780,7 +853,15 @@ async fn test_scan_only_nested_dirs() {
 
     let (gs, exclude) = build_globset(Some("**/*.txt"), &None).unwrap();
 
-    let (files, bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 4,
+        min_size: 0,
+        verbose: false,
+    };
+
+    let (files, bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -790,21 +871,25 @@ async fn test_scan_only_nested_dirs() {
 
 #[tokio::test]
 async fn test_scan_only_large_parallelism() {
+    use super::DeleteConfig;
+
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("test.txt"), "x").await.unwrap();
 
     let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
+    let config = DeleteConfig {
+        use_trash: false,
+        dry_run: false,
+        parallelism: 100,
+        min_size: 0,
+        verbose: false,
+    };
+
     // Test with high parallelism value
-    let (files, _, _) = scan_only(
-        vec![temp.path().to_path_buf()],
-        gs,
-        exclude,
-        0,
-        100, // high parallelism
-    )
-    .await
-    .unwrap();
+    let (files, _, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+        .await
+        .unwrap();
 
     assert_eq!(files, 1);
 }

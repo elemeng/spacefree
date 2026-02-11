@@ -1,6 +1,6 @@
 # 🚀 spacefree
 
-> ⚡ High-performance file deletion tool with trash support
+> ⚠️ Ultra-fast file deletion CLI tool (supports trash)
 
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/) [![Crates.io](https://img.shields.io/crates/v/spacefree?style=for-the-badge)](https://crates.io/crates/spacefree) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
@@ -15,6 +15,7 @@
 | 🎯 **Flexible** | Glob patterns, size filters, exclusion rules |
 | 📁 **Batch Ready** | Accept directories or path list files (CSV/TXT) |
 | 🧹 **Smart** | Automatically skips non-existent paths, deduplicates |
+| 👁️ **Verbose** | Optional detailed file listing for visibility |
 
 ### 🖥️ Platform Support
 
@@ -34,12 +35,21 @@
 cargo install spacefree
 ```
 
+The installed binary is named `spa`.
+
 ### From source
 
 ```bash
 git clone https://github.com/elemeng/spacefree
 cd spacefree
 cargo install --path .
+```
+
+Or build and run directly:
+
+```bash
+cargo build --release
+./target/release/spa --help
 ```
 
 ---
@@ -50,24 +60,16 @@ cargo install --path .
 
 ```bash
 # 🗑️  Delete ALL files from directories (be careful!)
-$ spacefree J12 J13 J14
+$ spa J12 J13 J14
 
 # 👀 Preview before delete (dry run - recommended)
-$ spacefree J12 --dry-run
+$ spa J12 --dry-run
 
 # 🎯 Delete only specific file types
-$ spacefree J12 -g "*.log"
+$ spa J12 -g "*.log"
 
 # ♻️  Move to system trash (safer)
-$ spacefree J12 --trash
-```
-
-### 🏷️  Shorthand Alias
-
-The binary `spa` is provided as a convenient alias:
-
-```bash
-spa J12 --dry-run
+$ spa J12 --trash
 ```
 
 ---
@@ -78,26 +80,26 @@ spa J12 --dry-run
 
 ```bash
 # Only files >= 10 megabytes
-$ spacefree J12 --min-size 10M
+$ spa J12 --min-size 10M
 
 # Supported units: B (bytes), K/KB, M/MB, G/GB, T/TB
-$ spacefree J12 --min-size 1G      # 1 gigabyte
-$ spacefree J12 --min-size 512k    # 512 kilobytes
+$ spa J12 --min-size 1G      # 1 gigabyte
+$ spa J12 --min-size 512k    # 512 kilobytes
 ```
 
 ### File Patterns (Glob)
 
-By default, **all files** are selected. Use `-g` to filter:
+By default, **all files** (`**/*`) are selected. Use `-g` to filter:
 
 ```bash
 # Delete only .log files
-$ spacefree J12 -g "*.log"
+$ spa J12 -g "*.log"
 
 # Multiple patterns
-$ spacefree J12 -g "**/*.{tmp,cache}"
+$ spa J12 -g "**/*.{tmp,cache}"
 
 # Exclude certain patterns
-$ spacefree J12 -g "*.txt" --exclude "**/important.txt"
+$ spa J12 -g "*.txt" --exclude "**/important.txt"
 ```
 
 ### Batch Processing from File
@@ -113,27 +115,34 @@ J15
 Then run:
 
 ```bash
-spacefree jobs.txt
+spa jobs.txt
 ```
 
 Or mix directories and files:
 
 ```bash
-spacefree J12 jobs.txt J20
+spa J12 jobs.txt J20
 ```
 
 ### Skip Confirmation
 
 ```bash
 # Auto-confirm deletion (use with caution!)
-$ spacefree J12 --yes
+$ spa J12 --yes
 ```
 
 ### Parallel Workers
 
 ```bash
 # Use 16 parallel workers (default: num_cpus * 4)
-$ spacefree J12 -p 16
+$ spa J12 -p 16
+```
+
+### Verbose Mode
+
+```bash
+# Show all files to be deleted
+$ spa J12 -v --dry-run
 ```
 
 ---
@@ -141,19 +150,20 @@ $ spacefree J12 -p 16
 ## 🛠️ Command Reference
 
 ```
-Usage: spacefree [OPTIONS] <PATHS>...
+Usage: spa [OPTIONS] <PATHS>...
 
 Arguments:
-  <PATHS>...  Job directories or path list files
+  <PATHS>...  Job directories or path list files (comma/space/newline separated)
 
 Options:
-  -g, --glob <PATTERN>     Glob pattern for files [default: **/*.mrc]
-      --exclude <PATTERN>  Glob pattern to exclude
-      --min-size <SIZE>    Minimum file size (e.g., 10M, 1G) [default: 0]
+  -g, --glob <PATTERN>     Glob pattern for files to delete [default: **/* (all files)]
+      --exclude <PATTERN>  Glob pattern to exclude from deletion
+      --min-size <SIZE>    Minimum file size (e.g., 100, 10k, 5M, 2G, 1T) [default: 0]
       --trash              Move to system trash instead of permanent delete
-      --dry-run            Preview what would be deleted
+      --dry-run            Preview what would be deleted without actually deleting
   -y, --yes                Skip confirmation prompt
-  -p, --parallelism <N>    Number of parallel workers
+  -p, --parallelism <N>    Number of parallel workers [default: num_cpus * 4]
+  -v, --verbose            Show all files to be deleted (verbose mode)
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -195,7 +205,10 @@ cd spacefree
 cargo test
 
 # Run with debug output
-cargo run --bin spacefree -- J12 --dry-run
+cargo run --bin spa -- J12 --dry-run
+
+# Build release binary
+cargo build --release
 
 # Check code style
 cargo clippy
