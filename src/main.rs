@@ -27,11 +27,11 @@ enum DeleterError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("Invalid parent directory: {0}")]
-    ParentDir(PathBuf),
+    #[error("Invalid job directory: {0}")]
+    JobDir(PathBuf),
 
-    #[error("No valid job numbers provided")]
-    NoValidJobs,
+    #[error("No valid paths provided")]
+    NoValidPaths,
 
     #[error("User cancelled")]
     Cancelled,
@@ -56,33 +56,38 @@ enum DeleterError {
     version
 )]
 struct Cli {
-    #[arg(short, long)]
-    dir: PathBuf,
+    /// Job directories to scan (space separated, e.g., J12 J13).
+    /// Can also be CSV/TXT files containing paths (comma/space/newline separated).
+    #[arg(required = true, value_name = "PATHS")]
+    paths: Vec<PathBuf>,
 
-    #[arg(short, long, num_args = 1..)]
-    job: Vec<String>,
-
-    #[arg(short, long, default_value = "**/*.mrc")]
+    /// Glob pattern for files to delete
+    #[arg(short, long, default_value = "**/*.mrc", value_name = "PATTERN")]
     glob: String,
 
-    #[arg(long)]
+    /// Glob pattern to exclude
+    #[arg(long, value_name = "PATTERN")]
     exclude: Option<String>,
 
-    #[arg(short, long)]
-    dry_run: bool,
-
-    #[arg(short, long)]
-    yes: bool,
+    /// Minimum file size in bytes
+    #[arg(long, value_name = "BYTES", default_value_t = 0)]
+    min_size: u64,
 
     /// Move to system trash instead of permanent delete
     #[arg(long)]
     trash: bool,
 
-    #[arg(short, long, default_value_t = num_cpus::get() * 4)]
-    parallelism: usize,
+    /// Preview what would be deleted without actually deleting
+    #[arg(long)]
+    dry_run: bool,
 
-    #[arg(long, default_value_t = 0)]
-    min_size: u64,
+    /// Skip confirmation prompt
+    #[arg(short, long)]
+    yes: bool,
+
+    /// Number of parallel workers
+    #[arg(short, long, default_value_t = num_cpus::get() * 4, value_name = "N")]
+    parallelism: usize,
 }
 
 //
@@ -107,32 +112,6 @@ fn format_size(size: u64) -> String {
     } else {
         format!("{f:.2} {}", UNITS[u])
     }
-}
-
-fn parse_jobs(raw: &[String]) -> Result<Vec<String>, DeleterError> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for r in raw {
-        for part in r.split(|c| c == ',' || c == ' ') {
-            let digits: String = part.chars().filter(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                continue;
-            }
-
-            let j = format!("J{}", digits);
-
-            if seen.insert(j.clone()) {
-                out.push(j);
-            }
-        }
-    }
-
-    if out.is_empty() {
-        return Err(DeleterError::NoValidJobs);
-    }
-
-    Ok(out)
 }
 
 fn build_globset(include: &str, exclude: &Option<String>) -> Result<GlobSet, DeleterError> {
@@ -316,23 +295,70 @@ fn confirm(files: u64, bytes: u64, preview: &[PathBuf], trash: bool) -> Result<(
 // ──────────────────────────────────────────────────────────
 //
 
+/// Parse paths from file content (comma, space, or newline separated)
+fn parse_paths_from_content(content: &str) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    
+    for line in content.lines() {
+        for part in line.split([',', ' ', '\t']) {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(trimmed);
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DeleterError> {
     let cli = Cli::parse();
 
-    if !fs::metadata(&cli.dir).await?.is_dir() {
-        return Err(DeleterError::ParentDir(cli.dir));
+    // Collect all paths (direct dirs or from files)
+    let mut all_paths: Vec<PathBuf> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in &cli.paths {
+        let metadata = fs::metadata(path).await?;
+        if metadata.is_file() {
+            // Read file and parse paths
+            let content = fs::read_to_string(path).await?;
+            for p in parse_paths_from_content(&content) {
+                if seen.insert(p.clone()) {
+                    all_paths.push(p);
+                }
+            }
+        } else if metadata.is_dir() {
+            if seen.insert(path.clone()) {
+                all_paths.push(path.clone());
+            }
+        } else {
+            return Err(DeleterError::JobDir(path.clone()));
+        }
     }
 
-    let jobs = parse_jobs(&cli.job)?;
-    let job_paths: Vec<PathBuf> = jobs.iter().map(|j| cli.dir.join(j)).collect();
+    if all_paths.is_empty() {
+        return Err(DeleterError::NoValidPaths);
+    }
+
+    // Validate all are directories
+    for path in &all_paths {
+        if !fs::metadata(path).await?.is_dir() {
+            return Err(DeleterError::JobDir(path.clone()));
+        }
+    }
 
     let globset = build_globset(&cli.glob, &cli.exclude)?;
 
     println!("🔍 Scanning...");
 
     let (files, bytes, preview) = scan_only(
-        job_paths.clone(),
+        all_paths.clone(),
         globset.clone(),
         cli.min_size,
         cli.parallelism,
@@ -362,7 +388,7 @@ async fn main() -> Result<(), DeleterError> {
     println!("🗑️  Processing...");
 
     let deleted = delete_streaming(
-        job_paths,
+        all_paths,
         globset,
         cli.dry_run,
         cli.trash,
