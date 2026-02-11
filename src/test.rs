@@ -376,7 +376,7 @@ async fn test_delete_streaming_dry_run() {
         verbose: false,
     };
 
-    let deleted = delete_streaming(
+    let (deleted, failed, _) = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
         exclude,
@@ -391,6 +391,7 @@ async fn test_delete_streaming_dry_run() {
 
     // But deleted counter is still 0 in dry_run
     assert_eq!(deleted, 0);
+    assert_eq!(failed, 0);
 }
 
 #[tokio::test]
@@ -414,7 +415,7 @@ async fn test_delete_streaming_actual_delete() {
         verbose: false,
     };
 
-    let deleted = delete_streaming(
+    let (deleted, failed, _) = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
         exclude,
@@ -425,6 +426,7 @@ async fn test_delete_streaming_actual_delete() {
     .unwrap();
 
     assert_eq!(deleted, 1);
+    assert_eq!(failed, 0);
     assert!(!temp.path().join("file.txt").exists());
 }
 
@@ -450,7 +452,7 @@ async fn test_delete_streaming_with_min_size() {
         verbose: false,
     };
 
-    let deleted = delete_streaming(
+    let (deleted, failed, _) = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
         exclude,
@@ -461,6 +463,7 @@ async fn test_delete_streaming_with_min_size() {
     .unwrap();
 
     assert_eq!(deleted, 1); // only large.txt
+    assert_eq!(failed, 0);
     assert!(temp.path().join("small.txt").exists());
     assert!(!temp.path().join("large.txt").exists());
 }

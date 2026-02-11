@@ -281,8 +281,10 @@ async fn delete_streaming(
     exclude_glob: Option<globset::GlobMatcher>,
     config: DeleteConfig,
     pb: ProgressBar,
-) -> Result<u64, DeleterError> {
+) -> Result<(u64, u64, Vec<PathBuf>), DeleterError> {
     let deleted = Arc::new(AtomicU64::new(0));
+    let failed = Arc::new(AtomicU64::new(0));
+    let failed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let stream = stream::iter(roots).flat_map(|root| {
         let globset = globset.clone();
@@ -313,6 +315,8 @@ async fn delete_streaming(
     stream
         .for_each_concurrent(config.parallelism, |path| {
             let deleted = deleted.clone();
+            let failed = failed.clone();
+            let failed_paths = failed_paths.clone();
             let pb = pb.clone();
             let config = config.clone();
 
@@ -322,12 +326,28 @@ async fn delete_streaming(
                 }
 
                 if !config.dry_run {
-                    if config.use_trash {
-                        let _ = tokio::task::spawn_blocking(move || trash_delete(&path)).await;
+                    let path_clone = path.clone();
+                    let success = if config.use_trash {
+                        tokio::task::spawn_blocking(move || trash_delete(&path_clone))
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false)
                     } else {
-                        let _ = fs::remove_file(&path).await;
+                        fs::remove_file(&path).await.is_ok()
+                    };
+
+                    if success {
+                        deleted.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        let mut paths = failed_paths.lock().unwrap();
+                        paths.push(path.clone());
+                        if config.verbose {
+                            pb.suspend(|| {
+                                eprintln!("❌ Failed to delete: {}", path.display());
+                            });
+                        }
                     }
-                    deleted.fetch_add(1, Ordering::Relaxed);
                 }
 
                 pb.inc(1);
@@ -336,7 +356,14 @@ async fn delete_streaming(
         .await;
 
     pb.finish();
-    Ok(deleted.load(Ordering::Relaxed))
+
+    let failed_count = failed.load(Ordering::Relaxed);
+    if failed_count > 0 {
+        let paths = failed_paths.lock().unwrap().clone();
+        Ok((deleted.load(Ordering::Relaxed), failed_count, paths))
+    } else {
+        Ok((deleted.load(Ordering::Relaxed), 0, Vec::new()))
+    }
 }
 
 //
@@ -472,11 +499,19 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     println!("🗑️  Processing...");
 
-    let deleted = delete_streaming(all_paths, globset, exclude_glob, config, pb).await?;
+    let (deleted, failed, failed_paths) = delete_streaming(all_paths, globset, exclude_glob, config, pb).await?;
 
     if cli.dry_run {
         println!("Preview complete.");
     } else {
+        if failed > 0 {
+            eprintln!();
+            eprintln!("⚠️  {} file(s) failed to delete:", failed);
+            for path in &failed_paths {
+                eprintln!("  - {}", path.display());
+            }
+            eprintln!("  (Check file permissions)");
+        }
         println!("✅ Removed {} files, freed {}", deleted, format_size(bytes));
     }
 
