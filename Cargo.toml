@@ -1,0 +1,15 @@
+[package]
+name = "spacefree"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+globset = "0.4"
+indicatif = "0.18"
+num_cpus = "1.16"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["fs", "rt-multi-thread", "macros"] }
+trash = "5.2"
+walkdir = "2.5"
