@@ -1,6 +1,6 @@
 # 🚀 spacefree
 
-> ⚡ High-performance file deletion tool with system trash support
+> ⚡High-performance file deletion tool with system trash support
 
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/) [![Crates.io](https://img.shields.io/crates/v/spacefree?style=for-the-badge)](https://crates.io/crates/spacefree) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
@@ -37,7 +37,7 @@ cargo install spacefree
 ### From source
 
 ```bash
-git clone https://github.com/yourusername/spacefree
+git clone https://github.com/elemeng/spacefree
 cd spacefree
 cargo install --path .
 ```
@@ -164,9 +164,46 @@ Options:
 
 ---
 
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Development Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/elemeng/spacefree
+cd spacefree
+
+# Run tests
+cargo test
+
+# Run with debug output
+cargo run --bin spacefree -- J12 --dry-run
+
+# Check code style
+cargo clippy
+
+# Format code
+cargo fmt
+```
+
+### Bug Reports & Feature Requests
+
+Please use [GitHub Issues](https://github.com/elemeng/spacefree/issues) to report bugs or request features.
+
+When reporting bugs, please include:
+
+- Operating system and version
+- Rust version (`rustc --version`)
+- Steps to reproduce
+- Expected vs actual behavior
+
+---
+
 ## 📄 License
 
-MIT © [Your Name](https://github.com/yourusername)
+MIT © [elemeng](https://github.com/elemeng/spacefree/LICENSE)
 
 ---
 
