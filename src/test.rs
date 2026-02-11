@@ -245,9 +245,10 @@ async fn test_scan_only_empty_dir() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, bytes, preview, _dirs) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -281,9 +282,10 @@ async fn test_scan_only_with_files() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, bytes, preview, _dirs) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -313,9 +315,10 @@ async fn test_scan_only_with_min_size() {
         parallelism: 4,
         min_size: 10,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, _bytes, _, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -340,9 +343,10 @@ async fn test_scan_only_multiple_dirs() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, bytes, _) = scan_only(
+    let (files, bytes, _, _) = scan_only(
         vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()],
         gs,
         exclude,
@@ -374,14 +378,16 @@ async fn test_delete_streaming_dry_run() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
+    let mut undo_log = UndoLog::new();
     let (deleted, failed, _) = delete_streaming(
-        vec![temp.path().to_path_buf()],
-        gs,
-        exclude,
+        vec![temp.path().join("file.txt")],
+        vec![],
         config,
         pb,
+        &mut undo_log,
     )
     .await
     .unwrap();
@@ -413,14 +419,16 @@ async fn test_delete_streaming_actual_delete() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
+    let mut undo_log = UndoLog::new();
     let (deleted, failed, _) = delete_streaming(
-        vec![temp.path().to_path_buf()],
-        gs,
-        exclude,
+        vec![temp.path().join("file.txt")],
+        vec![],
         config,
         pb,
+        &mut undo_log,
     )
     .await
     .unwrap();
@@ -431,41 +439,46 @@ async fn test_delete_streaming_actual_delete() {
 }
 
 #[tokio::test]
-async fn test_delete_streaming_with_min_size() {
+async fn test_delete_streaming_deletes_all_files() {
     use super::DeleteConfig;
 
     let temp = TempDir::new().unwrap();
 
-    fs::write(temp.path().join("small.txt"), "x").await.unwrap();
-    fs::write(temp.path().join("large.txt"), "this is large")
-        .await
-        .unwrap();
+    fs::write(temp.path().join("file1.txt"), "content1").await.unwrap();
+    fs::write(temp.path().join("file2.txt"), "content2").await.unwrap();
 
-    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
+    let _ = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
     let config = DeleteConfig {
         use_trash: false,
         dry_run: false,
         parallelism: 4,
-        min_size: 5,
+        min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
+    let mut undo_log = UndoLog::new();
+    let file_list = vec![
+        temp.path().join("file1.txt"),
+        temp.path().join("file2.txt"),
+    ];
     let (deleted, failed, _) = delete_streaming(
-        vec![temp.path().to_path_buf()],
-        gs,
-        exclude,
+        file_list,
+        vec![],
         config,
         pb,
+        &mut undo_log,
     )
     .await
     .unwrap();
 
-    assert_eq!(deleted, 1); // only large.txt
+    // delete_streaming deletes all files passed to it (filtering happens in scan_only)
+    assert_eq!(deleted, 2);
     assert_eq!(failed, 0);
-    assert!(temp.path().join("small.txt").exists());
-    assert!(!temp.path().join("large.txt").exists());
+    assert!(!temp.path().join("file1.txt").exists());
+    assert!(!temp.path().join("file2.txt").exists());
 }
 
 
@@ -581,9 +594,10 @@ async fn test_scan_only_returns_all_files() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, _bytes, all_files) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, _bytes, all_files, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -625,9 +639,10 @@ async fn test_scan_only_with_glob_pattern() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, _bytes, _, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -657,6 +672,7 @@ async fn test_run_no_matches() {
         yes: true,
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -680,6 +696,7 @@ async fn test_run_dry_run() {
         yes: false,
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -705,6 +722,7 @@ async fn test_run_with_files_auto_confirm() {
         yes: true, // auto confirm
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -733,6 +751,7 @@ async fn test_run_with_exclude() {
         yes: true,
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -760,6 +779,7 @@ async fn test_run_with_min_size_filter() {
         yes: true,
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -783,6 +803,7 @@ async fn test_run_trash_mode_dry_run() {
         yes: true,
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -809,6 +830,7 @@ async fn test_run_multiple_paths() {
         yes: true,
         parallelism: 4,
         verbose: false,
+        dirs: false,
     };
 
     let result = run(cli).await;
@@ -819,23 +841,24 @@ async fn test_run_multiple_paths() {
 
 // ========== Edge case tests for error paths ==========
 #[tokio::test]
-async fn test_collect_paths_nested_dir_validation() {
+async fn test_collect_paths_from_file_not_validated() {
+    // Paths from files are NOT validated in collect_paths anymore
+    // They are validated during scanning (scan_only)
     let temp = TempDir::new().unwrap();
 
-    // Create a file (not a dir) in the list file
-    let fake_file = temp.path().join("not_a_dir.txt");
-    fs::write(&fake_file, "this is not a directory")
-        .await
-        .unwrap();
-
+    // Create a file containing paths (even if some don't exist)
     let list_file = temp.path().join("jobs.txt");
-    fs::write(&list_file, format!("{}\n", fake_file.display()))
+    fs::write(&list_file, "/nonexistent/path1\n/nonexistent/path2\n")
         .await
         .unwrap();
 
-    // Should fail because fake_file is not a directory
-    let result = collect_paths(&[list_file]).await;
-    assert!(matches!(result, Err(DeleterError::JobDir(_))));
+    // Should succeed - paths from files are not validated here
+    let result = collect_paths(&[list_file.clone()]).await;
+    assert!(result.is_ok());
+    
+    // The paths should be collected
+    let paths = result.unwrap();
+    assert_eq!(paths.len(), 2);
 }
 
 #[tokio::test]
@@ -862,9 +885,10 @@ async fn test_scan_only_nested_dirs() {
         parallelism: 4,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
-    let (files, bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, bytes, _, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -887,10 +911,11 @@ async fn test_scan_only_large_parallelism() {
         parallelism: 100,
         min_size: 0,
         verbose: false,
+        dirs: false,
     };
 
     // Test with high parallelism value
-    let (files, _, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
+    let (files, _, _, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, &config)
         .await
         .unwrap();
 
@@ -1004,4 +1029,33 @@ fn test_cli_parse_with_size_units() {
 
     let cli = Cli::parse_from(["spacefree", "--min-size", "512K", "J12"]);
     assert_eq!(cli.min_size, 512 * 1024);
+}
+
+// ========== Undo Log tests ==========
+#[test]
+fn test_undo_log_new() {
+    let log = UndoLog::new();
+    assert!(!log.session_id.is_empty());
+    assert!(log.items.is_empty());
+}
+
+#[test]
+fn test_undo_log_add_item() {
+    let mut log = UndoLog::new();
+    log.add_item(PathBuf::from("/tmp/test.txt"), false, true);
+    assert_eq!(log.items.len(), 1);
+    assert_eq!(log.items[0].path, PathBuf::from("/tmp/test.txt"));
+    assert!(!log.items[0].is_dir);
+    
+    log.add_item(PathBuf::from("/tmp/test_dir"), true, false);
+    assert_eq!(log.items.len(), 2);
+    assert_eq!(log.items[1].path, PathBuf::from("/tmp/test_dir"));
+    assert!(log.items[1].is_dir);
+}
+
+#[test]
+fn test_undo_log_save_empty() {
+    let log = UndoLog::new();
+    // Should not fail for empty logs
+    assert!(log.save().is_ok());
 }
