@@ -1,20 +1,18 @@
 use clap::Parser;
-use futures::{StreamExt, stream};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
-    io::{self, Write},
+    io::Write,
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::fs;
+use tokio::{fs, io::AsyncWriteExt, sync::mpsc, task::spawn_blocking};
 use tracing::{debug, error, info, warn};
 use trash::delete as trash_delete;
 use walkdir::WalkDir;
@@ -28,7 +26,7 @@ use walkdir::WalkDir;
 #[derive(Error, Debug)]
 enum DeleterError {
     #[error("IO error: {0}")]
-    Io(#[from] io::Error),
+    Io(#[from] std::io::Error),
 
     #[error("Invalid job directory: {0}")]
     JobDir(PathBuf),
@@ -47,13 +45,13 @@ enum DeleterError {
 
     #[error("Progress bar error: {0}")]
     ProgressBar(String),
-
 }
 
 //
 // ──────────────────────────────────────────────────────────
 // Delete Log
 // ──────────────────────────────────────────────────────────
+//
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DeletedItem {
@@ -72,16 +70,6 @@ fn generate_log_filename() -> PathBuf {
         }
         counter += 1;
     }
-}
-
-/// Save deleted items to log file
-fn save_delete_log(items: &[DeletedItem], path: &PathBuf) -> Result<(), DeleterError> {
-    let content = serde_json::to_string_pretty(items)
-        .map_err(|e| DeleterError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
-    
-    std::fs::write(path, content)?;
-    info!("Delete log saved to: {}", path.display());
-    Ok(())
 }
 
 //
@@ -141,6 +129,10 @@ struct Cli {
     #[arg(short, long)]
     yes: bool,
 
+    /// Allow deleting root directory (requires -y as well)
+    #[arg(long)]
+    delete_root_dir: bool,
+
     /// Number of parallel workers
     #[arg(short, long, default_value_t = num_cpus::get() * 4, value_name = "N")]
     parallelism: usize,
@@ -182,7 +174,6 @@ fn format_size(size: u64) -> String {
     }
 }
 
-/// Parse size string with optional unit suffix.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -212,7 +203,6 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| "size overflow".to_string())
 }
 
-/// Parse age string (e.g., 1d, 2w, 3m, 1y) and return seconds.
 fn parse_age(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -235,8 +225,8 @@ fn parse_age(s: &str) -> Result<u64, String> {
         "h" | "hour" | "hours" => num * 3600,
         "d" | "day" | "days" => num * 86400,
         "w" | "week" | "weeks" => num * 604800,
-        "M" | "month" | "months" => num * 2592000, // 30 days
-        "y" | "year" | "years" => num * 31536000, // 365 days
+        "M" | "month" | "months" => num * 2592000,
+        "y" | "year" | "years" => num * 31536000,
         _ => return Err(format!("invalid age unit: {}", unit_part)),
     };
 
@@ -246,7 +236,7 @@ fn parse_age(s: &str) -> Result<u64, String> {
 fn build_globset(
     include: Option<&str>,
     exclude: &Option<String>,
-) -> Result<(GlobSet, Option<globset::GlobMatcher>), DeleterError> {
+) -> Result<(GlobSet, Option<GlobMatcher>), DeleterError> {
     let mut builder = GlobSetBuilder::new();
 
     let pattern = include.unwrap_or("**/*");
@@ -286,6 +276,7 @@ fn format_dirs(paths: &[PathBuf]) -> String {
 // ──────────────────────────────────────────────────────────
 // Config structs
 // ──────────────────────────────────────────────────────────
+//
 
 #[derive(Clone)]
 struct DeleteConfig {
@@ -298,450 +289,32 @@ struct DeleteConfig {
     max_age: Option<u64>,
     verbose: bool,
     dirs: bool,
-}
-
-// ──────────────────────────────────────────────────────────
-// Scan phase
-// ──────────────────────────────────────────────────────────
-//
-
-async fn scan_only(
-    job_paths: Vec<PathBuf>,
-    globset: GlobSet,
-    exclude_glob: Option<globset::GlobMatcher>,
-    config: &DeleteConfig,
-) -> Result<(u64, u64, Vec<PathBuf>, Vec<PathBuf>), DeleterError> {
-    // Separate directories and files
-    let mut directories = Vec::new();
-    let mut individual_files = Vec::new();
-    
-    for path in job_paths {
-        match fs::metadata(&path).await {
-            Ok(m) if m.is_dir() => directories.push(path),
-            Ok(m) if m.is_file() => individual_files.push(path),
-            Ok(_) => {
-                warn!("Path is neither file nor directory, skipping: {}", path.display());
-            }
-            Err(e) => {
-                warn!("Cannot access path ({}), skipping: {}", e, path.display());
-            }
-        }
-    }
-
-    let mut total_files = 0;
-    let mut total_bytes = 0;
-    let mut all_files = Vec::new();
-    let mut all_dirs = Vec::new();
-
-    // Process individual files directly
-    if !individual_files.is_empty() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("System time went backwards")
-            .as_secs();
-
-        for path in individual_files {
-            // Check exclude first
-            if let Some(ref exclude) = exclude_glob {
-                if exclude.is_match(&path) {
-                    continue;
-                }
-            }
-
-            // Individual files are always included (glob doesn't apply to direct file paths)
-            // unless excluded
-
-            match fs::metadata(&path).await {
-                Ok(m) => {
-                    let len = m.len();
-                    // Size filters
-                    if len < config.min_size {
-                        continue;
-                    }
-                    if let Some(max) = config.max_size {
-                        if len > max {
-                            continue;
-                        }
-                    }
-                    // Age filters
-                    if let Ok(modified) = m.modified() {
-                        let modified_secs = modified
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(now);
-                        let age = now.saturating_sub(modified_secs);
-                        if let Some(min) = config.min_age {
-                            if age < min {
-                                continue;
-                            }
-                        }
-                        if let Some(max) = config.max_age {
-                            if age > max {
-                                continue;
-                            }
-                        }
-                    }
-                    total_files += 1;
-                    total_bytes += len;
-                    all_files.push(path);
-                }
-                Err(e) => {
-                    warn!("Failed to read metadata for {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
-
-    // Process directories by walking them
-    if !directories.is_empty() {
-        let results = stream::iter(directories)
-            .map(|root| {
-                let globset = globset.clone();
-                let exclude_glob = exclude_glob.clone();
-                let min_size = config.min_size;
-                let max_size = config.max_size;
-                let min_age = config.min_age;
-                let max_age = config.max_age;
-                let scan_dirs = config.dirs;
-
-                tokio::task::spawn_blocking(move || {
-                    let mut files = 0;
-                    let mut bytes = 0;
-                    let mut file_list = Vec::new();
-                    let mut dir_list = Vec::new();
-                    let mut metadata_errors = 0;
-
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("System time went backwards")
-                        .as_secs();
-
-                    for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
-                        let path = entry.path();
-                        
-                        // Check exclude first (cheap)
-                        if let Some(ref exclude) = exclude_glob {
-                            if exclude.is_match(path) {
-                                continue;
-                            }
-                        }
-
-                        if entry.file_type().is_file() {
-                            if !globset.is_match(path) {
-                                continue;
-                            }
-                            
-                            match entry.metadata() {
-                                Ok(m) => {
-                                    let len = m.len();
-                                    // Size filters
-                                    if len < min_size {
-                                        continue;
-                                    }
-                                    if let Some(max) = max_size {
-                                        if len > max {
-                                            continue;
-                                        }
-                                    }
-                                    // Age filters
-                                    if let Ok(modified) = m.modified() {
-                                        let modified_secs = modified
-                                            .duration_since(UNIX_EPOCH)
-                                            .map(|d| d.as_secs())
-                                            .unwrap_or(now);
-                                        let age = now.saturating_sub(modified_secs);
-                                        if let Some(min) = min_age {
-                                            if age < min {
-                                                continue;
-                                            }
-                                        }
-                                        if let Some(max) = max_age {
-                                            if age > max {
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    files += 1;
-                                    bytes += len;
-                                    file_list.push(path.to_path_buf());
-                                }
-                                Err(e) => {
-                                    metadata_errors += 1;
-                                    warn!("Failed to read metadata for {}: {}", path.display(), e);
-                                }
-                            }
-                        } else if scan_dirs && entry.file_type().is_dir() {
-                            // Skip root directory
-                            if path == root {
-                                continue;
-                            }
-                            // Check if directory matches glob
-                            if !globset.is_match(path) {
-                                continue;
-                            }
-                            dir_list.push(path.to_path_buf());
-                        }
-                    }
-
-                    if metadata_errors > 0 {
-                        warn!("{} files had metadata errors in {}", metadata_errors, root.display());
-                    }
-
-                    (files, bytes, file_list, dir_list)
-                })
-            })
-            .buffer_unordered(config.parallelism)
-            .collect::<Vec<_>>()
-            .await;
-
-        for r in results {
-            let (f, b, files, dirs) = r.map_err(|_| DeleterError::Join)?;
-            total_files += f;
-            total_bytes += b;
-            all_files.extend(files);
-            all_dirs.extend(dirs);
-        }
-    }
-
-    Ok((total_files, total_bytes, all_files, all_dirs))
+    glob_pattern: String,
+    glob_matcher: GlobSet,
+    exclude_matcher: Option<GlobMatcher>,
 }
 
 //
 // ──────────────────────────────────────────────────────────
-// Delete / Trash phase (true streaming)
+// Scan result
 // ──────────────────────────────────────────────────────────
 //
 
-async fn delete_streaming(
-    files: Vec<PathBuf>,
-    dirs: Vec<PathBuf>,
-    config: DeleteConfig,
-    pb: ProgressBar,
-    deleted_items: &mut Vec<DeletedItem>,
-) -> Result<(u64, u64, Vec<PathBuf>), DeleterError> {
-    let deleted = Arc::new(AtomicU64::new(0));
-    let failed = Arc::new(AtomicU64::new(0));
-    
-    // Use channel for collecting failed paths to avoid mutex contention
-    let (fail_tx, mut fail_rx) = tokio::sync::mpsc::channel::<PathBuf>(100);
-    let fail_tx = Arc::new(tokio::sync::Mutex::new(fail_tx));
-    
-    // Use Arc<Mutex<Vec<DeletedItem>>> for thread-safe access
-    let deleted_items_arc = Arc::new(tokio::sync::Mutex::new(deleted_items));
-
-    // Semaphore to limit blocking tasks and prevent thread explosion
-    let blocking_semaphore = Arc::new(tokio::sync::Semaphore::new(config.parallelism));
-    
-    // First, delete all files using batch processing for non-trash deletions
-    let file_stream = stream::iter(files);
-    file_stream
-        .for_each_concurrent(config.parallelism, |path| {
-            let deleted = deleted.clone();
-            let failed = failed.clone();
-            let fail_tx = fail_tx.clone();
-            let deleted_items_arc = deleted_items_arc.clone();
-            let pb = pb.clone();
-            let config = config.clone();
-            let blocking_semaphore = blocking_semaphore.clone();
-
-            async move {
-                if config.verbose {
-                    pb.println(path.display().to_string());
-                }
-
-                if !config.dry_run {
-                    let path_clone = path.clone();
-                    
-                    let success = if config.use_trash {
-                        // Acquire semaphore permit before spawning blocking task
-                        let _permit = blocking_semaphore.acquire().await.expect("Semaphore closed");
-                        match tokio::task::spawn_blocking(move || trash_delete(&path_clone)).await {
-                            Ok(Ok(())) => {
-                                info!("Moved to trash: {}", path.display());
-                                true
-                            }
-                            Ok(Err(e)) => {
-                                error!("Failed to move to trash {}: {}", path.display(), e);
-                                false
-                            }
-                            Err(e) => {
-                                error!("Task join error for {}: {}", path.display(), e);
-                                false
-                            }
-                        }
-                    } else {
-                        // Direct async file deletion without blocking
-                        match fs::remove_file(&path).await {
-                            Ok(()) => {
-                                info!("Deleted: {}", path.display());
-                                true
-                            }
-                            Err(e) => {
-                                error!("Failed to delete {}: {}", path.display(), e);
-                                false
-                            }
-                        }
-                    };
-
-                    if success {
-                        deleted.fetch_add(1, Ordering::Relaxed);
-                        // Add to deleted items log
-                        deleted_items_arc.lock().await.push(DeletedItem {
-                            path,
-                            is_dir: false,
-                            deleted_at: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("System time went backwards")
-                                .as_secs(),
-                        });
-                    } else {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        let _ = fail_tx.lock().await.send(path.clone()).await;
-                        if config.verbose {
-                            pb.suspend(|| {
-                                eprintln!("❌ Failed to delete: {}", path.display());
-                            });
-                        }
-                    }
-                }
-
-                pb.inc(1);
-            }
-        })
-        .await;
-
-    // Then, delete empty directories (sorted by depth, deepest first) in parallel
-    if !dirs.is_empty() {
-        let mut sorted_dirs = dirs;
-        sorted_dirs.sort_by(|a, b| {
-            let depth_a = a.components().count();
-            let depth_b = b.components().count();
-            depth_b.cmp(&depth_a)
-        });
-
-        // Process directories in parallel
-        stream::iter(sorted_dirs)
-            .for_each_concurrent(config.parallelism, |dir| {
-                let deleted = deleted.clone();
-                let failed = failed.clone();
-                let fail_tx = fail_tx.clone();
-                let deleted_items_arc = deleted_items_arc.clone();
-                let pb = pb.clone();
-                let config = config.clone();
-                let blocking_semaphore = blocking_semaphore.clone();
-
-                async move {
-                    if config.verbose {
-                        pb.println(dir.display().to_string());
-                    }
-
-                    if !config.dry_run {
-                        let dir_for_check = dir.clone();
-
-                        // Check if directory is empty
-                        let is_empty = match tokio::task::spawn_blocking(move || {
-                            match std::fs::read_dir(&dir_for_check) {
-                                Ok(mut entries) => entries.next().is_none(),
-                                Err(e) => {
-                                    warn!("Failed to read directory {}: {}", dir_for_check.display(), e);
-                                    false
-                                }
-                            }
-                        }).await {
-                            Ok(empty) => empty,
-                            Err(e) => {
-                                error!("Task join error for directory check {}: {}", dir.display(), e);
-                                false
-                            }
-                        };
-
-                        if is_empty {
-                            let dir_clone = dir.clone();
-                            let success = if config.use_trash {
-                                // Acquire semaphore permit before spawning blocking task
-                                let _permit = blocking_semaphore.acquire().await.expect("Semaphore closed");
-                                match tokio::task::spawn_blocking(move || trash_delete(&dir_clone)).await {
-                                    Ok(Ok(())) => {
-                                        info!("Moved directory to trash: {}", dir.display());
-                                        true
-                                    }
-                                    Ok(Err(e)) => {
-                                        error!("Failed to move dir to trash {}: {}", dir.display(), e);
-                                        false
-                                    }
-                                    Err(e) => {
-                                        error!("Task join error for dir {}: {}", dir.display(), e);
-                                        false
-                                    }
-                                }
-                            } else {
-                                match fs::remove_dir(&dir).await {
-                                    Ok(()) => {
-                                        info!("Deleted directory: {}", dir.display());
-                                        true
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to delete directory {}: {}", dir.display(), e);
-                                        false
-                                    }
-                                }
-                            };
-
-                            if success {
-                                deleted.fetch_add(1, Ordering::Relaxed);
-                                deleted_items_arc.lock().await.push(DeletedItem {
-                                    path: dir,
-                                    is_dir: true,
-                                    deleted_at: SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .expect("System time went backwards")
-                                        .as_secs(),
-                                });
-                            } else {
-                                failed.fetch_add(1, Ordering::Relaxed);
-                                let _ = fail_tx.lock().await.send(dir.clone()).await;
-                                if config.verbose {
-                                    pb.suspend(|| {
-                                        eprintln!("❌ Failed to delete directory: {}", dir.display());
-                                    });
-                                }
-                            }
-                        } else {
-                            if config.verbose {
-                                pb.suspend(|| {
-                                    eprintln!("⏭️  Skipping non-empty directory: {}", dir.display());
-                                });
-                            }
-                        }
-                    }
-
-                    pb.inc(1);
-                }
-            })
-            .await;
-    }
-    
-    // Close channel and collect failed paths
-    drop(fail_tx);
-    let mut failed_paths = Vec::new();
-    while let Some(path) = fail_rx.recv().await {
-        failed_paths.push(path);
-    }
-
-    pb.finish();
-
-    let failed_count = failed.load(Ordering::Relaxed);
-    Ok((deleted.load(Ordering::Relaxed), failed_count, failed_paths))
+#[derive(Clone)]
+struct ScanResult {
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
 }
 
 //
 // ──────────────────────────────────────────────────────────
-// Collect paths from CLI (support file containing paths)
+// Collect paths
 // ──────────────────────────────────────────────────────────
 //
 
 fn parse_paths_from_content(content: &str) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut paths = Vec::new();
 
     for line in content.lines() {
@@ -762,9 +335,8 @@ fn parse_paths_from_content(content: &str) -> Vec<PathBuf> {
 
 async fn collect_paths(input_paths: &[PathBuf], path_list_files: &[PathBuf]) -> Result<Vec<PathBuf>, DeleterError> {
     let mut all_paths = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
 
-    // Handle path list files (files containing paths to scan)
     for path_file in path_list_files {
         let content = fs::read_to_string(path_file).await?;
         for p in parse_paths_from_content(&content) {
@@ -774,16 +346,13 @@ async fn collect_paths(input_paths: &[PathBuf], path_list_files: &[PathBuf]) -> 
         }
     }
 
-    // Handle direct paths (directories or files to delete)
     for path in input_paths {
         let metadata = fs::metadata(path).await?;
         if metadata.is_dir() {
-            // Directory - add directly
             if seen.insert(path.clone()) {
                 all_paths.push(path.clone());
             }
         } else if metadata.is_file() {
-            // Regular file - add as a file to delete, not a path list
             if seen.insert(path.clone()) {
                 all_paths.push(path.clone());
             }
@@ -801,6 +370,371 @@ async fn collect_paths(input_paths: &[PathBuf], path_list_files: &[PathBuf]) -> 
 
 //
 // ──────────────────────────────────────────────────────────
+// Scan phase (streaming to channel)
+// ──────────────────────────────────────────────────────────
+//
+
+async fn scan_to_channel(
+    root: PathBuf,
+    file_tx: mpsc::Sender<ScanResult>,
+    config: DeleteConfig,
+) -> Result<(), DeleterError> {
+    tokio::task::spawn_blocking(move || {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("System time went backwards")
+            .as_secs();
+
+        let mut scan_dirs = Vec::new();
+
+        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+            let path = entry.path();
+
+            if entry.file_type().is_file() {
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("Failed to read metadata for {}: {}", path.display(), e);
+                        continue;
+                    }
+                };
+
+                let len = metadata.len();
+                if len < config.min_size {
+                    continue;
+                }
+                if let Some(max) = config.max_size {
+                    if len > max {
+                        continue;
+                    }
+                }
+
+                if let Ok(modified) = metadata.modified() {
+                    let modified_secs = modified
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(now);
+                    let age = now.saturating_sub(modified_secs);
+                    if let Some(min) = config.min_age {
+                        if age < min {
+                            continue;
+                        }
+                    }
+                    if let Some(max) = config.max_age {
+                        if age > max {
+                            continue;
+                        }
+                    }
+                }
+
+                if !config.glob_matcher.is_match(path) {
+                    continue;
+                }
+
+                if let Some(ref exclude) = config.exclude_matcher {
+                    if exclude.is_match(path) {
+                        continue;
+                    }
+                }
+
+                if file_tx.blocking_send(ScanResult {
+                    path: path.to_path_buf(),
+                    is_dir: false,
+                    size: len,
+                }).is_err() {
+                    break;
+                }
+            } else if config.dirs && entry.file_type().is_dir() {
+                if path == root {
+                    continue;
+                }
+                scan_dirs.push(ScanResult {
+                    path: path.to_path_buf(),
+                    is_dir: true,
+                    size: 0,
+                });
+            }
+        }
+
+        for dir in scan_dirs {
+            if file_tx.blocking_send(dir).is_err() {
+                break;
+            }
+        }
+    }).await.map_err(|_| DeleterError::Join)?;
+
+    Ok(())
+}
+
+async fn scan_files_direct(
+    paths: Vec<PathBuf>,
+    file_tx: mpsc::Sender<ScanResult>,
+    config: DeleteConfig,
+) -> Result<(), DeleterError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time went backwards")
+        .as_secs();
+
+    for path in paths {
+        let metadata = match fs::metadata(&path).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to read metadata for {}: {}", path.display(), e);
+                continue;
+            }
+        };
+
+        let len = metadata.len();
+        if len < config.min_size {
+            continue;
+        }
+        if let Some(max) = config.max_size {
+            if len > max {
+                continue;
+            }
+        }
+
+        if let Ok(modified) = metadata.modified() {
+            let modified_secs = modified
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(now);
+            let age = now.saturating_sub(modified_secs);
+            if let Some(min) = config.min_age {
+                if age < min {
+                    continue;
+                }
+            }
+            if let Some(max) = config.max_age {
+                if age > max {
+                    continue;
+                }
+            }
+        }
+
+        if file_tx.send(ScanResult {
+            path,
+            is_dir: false,
+            size: len,
+        }).await.is_err() {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+//
+// ──────────────────────────────────────────────────────────
+// Delete phase (true streaming)
+// ──────────────────────────────────────────────────────────
+//
+
+async fn run_deletion_pipeline(
+    directories: Vec<PathBuf>,
+    individual_files: Vec<PathBuf>,
+    config: DeleteConfig,
+    pb: ProgressBar,
+    log_path: Option<PathBuf>,
+) -> Result<(u64, u64, u64, Vec<PathBuf>), DeleterError> {
+// Channels for streaming pipeline
+    let (scan_tx, mut scan_rx) = mpsc::channel::<ScanResult>(1000);
+    let (deleted_tx, mut deleted_rx) = mpsc::channel::<DeletedItem>(1000);
+    let (trash_tx, mut trash_rx) = mpsc::channel::<PathBuf>(1000);
+    let fail_tx = Arc::new(mpsc::channel::<PathBuf>(100).0);
+    let mut fail_rx = mpsc::channel::<PathBuf>(100).1;
+
+    let deleted_count = Arc::new(AtomicU64::new(0));
+    let failed_count = Arc::new(AtomicU64::new(0));
+    let bytes_freed = Arc::new(AtomicU64::new(0));
+
+    // Dedicated trash worker thread
+    let deleted_count_trash = deleted_count.clone();
+    let failed_count_trash = failed_count.clone();
+    let deleted_tx_trash = deleted_tx.clone();
+    let fail_tx_trash = fail_tx.clone();
+    spawn_blocking(move || {
+        while let Some(path) = trash_rx.blocking_recv() {
+            match trash_delete(&path) {
+                Ok(_) => {
+                    info!("Moved to trash: {}", path.display());
+                    deleted_count_trash.fetch_add(1, Ordering::Relaxed);
+                    let _ = deleted_tx_trash.blocking_send(DeletedItem {
+                        path: path.clone(),
+                        is_dir: false,
+                        deleted_at: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("System time went backwards")
+                            .as_secs(),
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to move to trash {}: {}", path.display(), e);
+                    failed_count_trash.fetch_add(1, Ordering::Relaxed);
+                    let _ = fail_tx_trash.blocking_send(path);
+                }
+            }
+        }
+    });
+
+    // Logger task (NDJSON incremental write)
+    let log_handle = if let Some(path) = log_path {
+        Some(tokio::spawn(async move {
+            if let Ok(mut file) = fs::File::create(&path).await {
+                while let Some(item) = deleted_rx.recv().await {
+                    if let Ok(json) = serde_json::to_string(&item) {
+                        let _ = file.write_all(json.as_bytes()).await;
+                        let _ = file.write_all(b"\n").await;
+                    }
+                }
+                info!("Delete log saved to: {}", path.display());
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Spawn scanner tasks
+    let scan_handles: Vec<_> = directories.into_iter().map(|root| {
+        let scan_tx = scan_tx.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let _ = scan_to_channel(root, scan_tx, config).await;
+        })
+    }).collect();
+
+    if !individual_files.is_empty() {
+        let scan_tx = scan_tx.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let _ = scan_files_direct(individual_files, scan_tx, config).await;
+        });
+    }
+
+    drop(scan_tx);
+
+    // Delete consumer with limited concurrency
+    let delete_count = deleted_count.clone();
+    let fail_count = failed_count.clone();
+    let total_bytes = bytes_freed.clone();
+    let fail_tx_for_tasks = fail_tx.clone();
+    let pb_clone = pb.clone();
+    let delete_handle = tokio::spawn(async move {
+        let (task_tx, mut task_rx) = mpsc::channel::<tokio::task::JoinHandle<()>>(config.parallelism);
+        
+        // Task processor
+        let processor = tokio::spawn(async move {
+            while let Some(task) = task_rx.recv().await {
+                let _ = task.await;
+            }
+        });
+        
+        while let Some(result) = scan_rx.recv().await {
+            let deleted_tx = deleted_tx.clone();
+            let fail_tx = fail_tx_for_tasks.clone();
+            let trash_tx = trash_tx.clone();
+            let pb = pb_clone.clone();
+            let config = config.clone();
+            let delete_count = delete_count.clone();
+            let fail_count = fail_count.clone();
+            let total_bytes = total_bytes.clone();
+
+            let task = tokio::spawn(async move {
+                if config.verbose {
+                    pb.println(result.path.display().to_string());
+                }
+
+                if !config.dry_run {
+                    let success = if result.is_dir {
+                        match fs::remove_dir(&result.path).await {
+                            Ok(_) => true,
+                            Err(ref e) if e.kind() == std::io::ErrorKind::Other => {
+                                if config.verbose {
+                                    pb.suspend(|| {
+                                        eprintln!("⏭️  Skipping non-empty directory: {}", result.path.display());
+                                    });
+                                }
+                                false
+                            }
+                            Err(_) => {
+                                error!("Failed to delete directory: {}", result.path.display());
+                                false
+                            }
+                        }
+                    } else {
+                        if config.use_trash {
+                            match trash_tx.send(result.path.clone()).await {
+                                Ok(_) => true,
+                                Err(_) => false,
+                            }
+                        } else {
+                            match fs::remove_file(&result.path).await {
+                                Ok(_) => {
+                                    info!("Deleted: {}", result.path.display());
+                                    true
+                                }
+                                Err(e) => {
+                                    error!("Failed to delete {}: {}", result.path.display(), e);
+                                    false
+                                }
+                            }
+                        }
+                    };
+
+                    if success && !result.is_dir {
+                        delete_count.fetch_add(1, Ordering::Relaxed);
+                        total_bytes.fetch_add(result.size, Ordering::Relaxed);
+                        deleted_tx.send(DeletedItem {
+                            path: result.path,
+                            is_dir: false,
+                            deleted_at: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("System time went backwards")
+                                .as_secs(),
+                        }).await.ok();
+                    } else if !success && !result.is_dir {
+                        fail_count.fetch_add(1, Ordering::Relaxed);
+                        fail_tx.send(result.path).await.ok();
+                    }
+                }
+
+                pb.inc(1);
+            });
+            
+            task_tx.send(task).await.ok();
+        }
+        
+        drop(task_tx);
+        processor.await.ok();
+    });
+
+    for handle in scan_handles {
+        handle.await.ok();
+    }
+    delete_handle.await.map_err(|_| DeleterError::Join)?;
+    if let Some(log_handle) = log_handle {
+        log_handle.await.map_err(|_| DeleterError::Join)?;
+    }
+
+    drop(fail_tx);
+    let mut failed_paths = Vec::new();
+    while let Some(path) = fail_rx.recv().await {
+        failed_paths.push(path);
+    }
+
+    pb.finish();
+
+    Ok((
+        deleted_count.load(Ordering::Relaxed),
+        failed_count.load(Ordering::Relaxed),
+        bytes_freed.load(Ordering::Relaxed),
+        failed_paths,
+    ))
+}
+
+//
+// ──────────────────────────────────────────────────────────
 // Main run
 // ──────────────────────────────────────────────────────────
 //
@@ -810,6 +744,8 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     let (globset, exclude_glob) = build_globset(cli.glob.as_deref(), &cli.exclude)?;
 
     println!("🔍 Scanning...");
+
+    let glob_pattern = cli.glob.as_deref().unwrap_or("**/*").to_string();
 
     let config = DeleteConfig {
         use_trash: cli.trash,
@@ -821,57 +757,99 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         max_age: cli.max_age,
         verbose: cli.verbose,
         dirs: cli.dirs,
+        glob_pattern: glob_pattern.clone(),
+        glob_matcher: globset,
+        exclude_matcher: exclude_glob,
     };
 
-    let (files_count, bytes, file_list, dir_list) = scan_only(
-        all_paths.clone(),
-        globset.clone(),
-        exclude_glob.clone(),
-        &config,
-    )
-    .await?;
+    // Check for root directory and require explicit confirmation
+    for path in &all_paths {
+        if path.as_os_str() == "/" || path.as_os_str() == "" {
+            if !cli.delete_root_dir {
+                eprintln!("❌ ERROR: Attempting to delete root directory (/)");
+                eprintln!("This is extremely dangerous and could destroy your entire system.");
+                eprintln!();
+                eprintln!("To delete root directory, you must use BOTH:");
+                eprintln!("  -y (skip confirmation)");
+                eprintln!("  --delete-root-dir (explicitly allow root deletion)");
+                eprintln!();
+                eprintln!("Example: spf / -y --delete-root-dir");
+                return Err(DeleterError::Cancelled);
+            }
+            if !cli.yes {
+                eprintln!("❌ ERROR: Deleting root directory (/) requires -y flag");
+                eprintln!();
+                eprintln!("You must use both:");
+                eprintln!("  -y (skip confirmation)");
+                eprintln!("  --delete-root-dir (explicitly allow root deletion)");
+                return Err(DeleterError::Cancelled);
+            }
+        }
+    }
 
-    let total_items = files_count + dir_list.len() as u64;
+    // Separate directories and individual files
+    let mut directories = Vec::new();
+    let mut individual_files = Vec::new();
+    
+    for path in &all_paths {
+        match fs::metadata(path).await {
+            Ok(m) if m.is_dir() => directories.push(path.clone()),
+            Ok(m) if m.is_file() => individual_files.push(path.clone()),
+            Ok(_) => warn!("Path is neither file nor directory, skipping: {}", path.display()),
+            Err(e) => warn!("Cannot access path ({}), skipping: {}", e, path.display()),
+        }
+    }
 
-    if total_items == 0 {
+    // Quick scan for preview (sample first few paths)
+    let mut preview_files = 0;
+    let mut preview_bytes = 0;
+    for path in &individual_files {
+        if let Ok(m) = fs::metadata(path).await {
+            preview_files += 1;
+            preview_bytes += m.len();
+        }
+    }
+    for dir in &directories {
+        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()).take(1000) {
+            if entry.file_type().is_file() {
+                if let Ok(m) = entry.metadata() {
+                    if m.len() >= cli.min_size {
+                        preview_files += 1;
+                        preview_bytes += m.len();
+                    }
+                }
+            }
+        }
+    }
+
+    let total_estimate = preview_files;
+    if total_estimate == 0 {
         println!("Nothing matched.");
         return Ok(());
     }
 
-    let glob_pattern = cli.glob.as_deref().unwrap_or("**/*");
     let mode = if cli.trash { "TRASH" } else { "PERMANENT" };
     let item_type = if cli.dirs {
         "files/empty dirs"
     } else {
         "files"
     };
+    
     println!(
-        "ALL '{}' {} in {} will be {} deleted!",
+        "Will scan and delete '{}' {} in {} with {} mode",
         glob_pattern,
         item_type,
         format_dirs(&all_paths),
         mode
     );
 
-    println!("Files: {}, Size: {}", files_count, format_size(bytes));
-    if cli.dirs && !dir_list.is_empty() {
-        println!("Empty directories to check: {}", dir_list.len());
-    }
-
-    if cli.verbose {
-        for p in &file_list {
-            println!("  {}", p.display());
-        }
-        for p in &dir_list {
-            println!("  {} (dir)", p.display());
-        }
-    }
+    println!("Estimated items: {}", total_estimate);
 
     if !cli.dry_run && !cli.yes {
         print!("\nType YES/Yes/yes/Y/y to continue: ");
-        io::stdout().flush()?;
+        std::io::stdout().flush()?;
         let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        std::io::stdin().read_line(&mut input)?;
         let trimmed = input.trim().to_lowercase();
         if trimmed != "yes" && trimmed != "y" {
             return Err(DeleterError::Cancelled);
@@ -879,7 +857,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     }
 
     let mp = MultiProgress::new();
-    let pb = mp.add(ProgressBar::new(total_items));
+    let pb = mp.add(ProgressBar::new(total_estimate as u64));
 
     pb.set_style(
         ProgressStyle::default_bar()
@@ -889,20 +867,23 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     println!("🗑️  Processing...");
 
-    let mut deleted_items: Vec<DeletedItem> = Vec::new();
-    let (deleted, failed, failed_paths) = delete_streaming(file_list, dir_list, config, pb, &mut deleted_items).await?;
-    
-    // Save log if --log is provided, not dry_run, and there are actual deleted items
-    if !cli.dry_run && cli.log.is_some() && !deleted_items.is_empty() {
-        let log_path = if let Some(Some(p)) = cli.log.as_ref() {
-            p.clone()
+    let log_path = if !cli.dry_run && cli.log.is_some() {
+        if let Some(Some(p)) = cli.log.as_ref() {
+            Some(p.clone())
         } else {
-            generate_log_filename()
-        };
-        if let Err(e) = save_delete_log(&deleted_items, &log_path) {
-            warn!("Failed to save delete log: {}", e);
+            Some(generate_log_filename())
         }
-    }
+    } else {
+        None
+    };
+
+    let (deleted, failed, bytes, failed_paths) = run_deletion_pipeline(
+        directories,
+        individual_files,
+        config,
+        pb,
+        log_path,
+    ).await?;
 
     if cli.dry_run {
         println!("Preview complete.");
@@ -923,10 +904,18 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
 #[tokio::main]
 async fn main() -> Result<(), DeleterError> {
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt::init();
-    
     let cli = Cli::parse();
+    
+    // Set log level based on verbose flag
+    if cli.verbose {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .init();
+    }
     
     debug!("Starting spacefree with CLI args: {:?}", cli);
     
@@ -938,5 +927,6 @@ async fn main() -> Result<(), DeleterError> {
     info!("spacefree completed successfully");
     Ok(())
 }
+
 #[cfg(test)]
 pub mod test;
