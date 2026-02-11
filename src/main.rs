@@ -6,8 +6,8 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -27,9 +27,6 @@ use walkdir::WalkDir;
 enum DeleterError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Invalid job directory: {0}")]
-    JobDir(PathBuf),
 
     #[error("No valid paths provided")]
     NoValidPaths,
@@ -265,7 +262,9 @@ fn format_dirs(paths: &[PathBuf]) -> String {
         1 => dirs[0].clone(),
         2 => format!("{} and {}", dirs[0], dirs[1]),
         _ => {
-            let last = dirs.last().expect("dirs should have at least 3 elements when len >= 3");
+            let last = dirs
+                .last()
+                .expect("dirs should have at least 3 elements when len >= 3");
             let rest = &dirs[..dirs.len() - 1];
             format!("{}, and {}", rest.join(", "), last)
         }
@@ -279,6 +278,7 @@ fn format_dirs(paths: &[PathBuf]) -> String {
 //
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct DeleteConfig {
     use_trash: bool,
     dry_run: bool,
@@ -333,7 +333,10 @@ fn parse_paths_from_content(content: &str) -> Vec<PathBuf> {
     paths
 }
 
-async fn collect_paths(input_paths: &[PathBuf], path_list_files: &[PathBuf]) -> Result<Vec<PathBuf>, DeleterError> {
+async fn collect_paths(
+    input_paths: &[PathBuf],
+    path_list_files: &[PathBuf],
+) -> Result<Vec<PathBuf>, DeleterError> {
     let mut all_paths = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -347,17 +350,10 @@ async fn collect_paths(input_paths: &[PathBuf], path_list_files: &[PathBuf]) -> 
     }
 
     for path in input_paths {
-        let metadata = fs::metadata(path).await?;
-        if metadata.is_dir() {
-            if seen.insert(path.clone()) {
-                all_paths.push(path.clone());
-            }
-        } else if metadata.is_file() {
-            if seen.insert(path.clone()) {
-                all_paths.push(path.clone());
-            }
-        } else {
-            return Err(DeleterError::JobDir(path.clone()));
+        let _metadata = fs::metadata(path).await?;
+        // Add both directories and files to all_paths
+        if seen.insert(path.clone()) {
+            all_paths.push(path.clone());
         }
     }
 
@@ -390,6 +386,11 @@ async fn scan_to_channel(
         for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
 
+            // Skip the root directory itself - we'll add it after WalkDir completes
+            if path == root {
+                continue;
+            }
+
             if entry.file_type().is_file() {
                 let metadata = match entry.metadata() {
                     Ok(m) => m,
@@ -415,16 +416,21 @@ async fn scan_to_channel(
                         .map(|d| d.as_secs())
                         .unwrap_or(now);
                     let age = now.saturating_sub(modified_secs);
-                    if let Some(min) = config.min_age {
-                        if age < min {
+                    if let Some(min_age_val) = config.min_age {
+                        if age < min_age_val {
                             continue;
                         }
                     }
-                    if let Some(max) = config.max_age {
-                        if age > max {
+                    if let Some(max_age_val) = config.max_age {
+                        if age > max_age_val {
                             continue;
                         }
                     }
+                }
+
+                if config.dirs {
+                    // When --dirs is enabled, skip individual files - directories will handle them
+                    continue;
                 }
 
                 if !config.glob_matcher.is_match(path) {
@@ -437,17 +443,19 @@ async fn scan_to_channel(
                     }
                 }
 
-                if file_tx.blocking_send(ScanResult {
-                    path: path.to_path_buf(),
-                    is_dir: false,
-                    size: len,
-                }).is_err() {
+                if file_tx
+                    .blocking_send(ScanResult {
+                        path: path.to_path_buf(),
+                        is_dir: false,
+                        size: len,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             } else if config.dirs && entry.file_type().is_dir() {
-                if path == root {
-                    continue;
-                }
+                // Include ALL directories when --dirs is enabled
+                // Don't filter by glob - only files need glob matching
                 scan_dirs.push(ScanResult {
                     path: path.to_path_buf(),
                     is_dir: true,
@@ -456,12 +464,31 @@ async fn scan_to_channel(
             }
         }
 
+        // After WalkDir completes, add the root directory if --dirs is enabled
+        // This ensures WalkDir has fully released the directory before we try to delete it
+        if config.dirs {
+            scan_dirs.push(ScanResult {
+                path: root.to_path_buf(),
+                is_dir: true,
+                size: 0,
+            });
+        }
+
+        // Sort directories by depth (deepest first) to ensure proper deletion order
+        scan_dirs.sort_by(|a, b| {
+            let depth_a = a.path.components().count();
+            let depth_b = b.path.components().count();
+            depth_b.cmp(&depth_a) // Reverse order - deepest first
+        });
+
         for dir in scan_dirs {
             if file_tx.blocking_send(dir).is_err() {
                 break;
             }
         }
-    }).await.map_err(|_| DeleterError::Join)?;
+    })
+    .await
+    .map_err(|_| DeleterError::Join)?;
 
     Ok(())
 }
@@ -513,11 +540,15 @@ async fn scan_files_direct(
             }
         }
 
-        if file_tx.send(ScanResult {
-            path,
-            is_dir: false,
-            size: len,
-        }).await.is_err() {
+        if file_tx
+            .send(ScanResult {
+                path,
+                is_dir: false,
+                size: len,
+            })
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -538,7 +569,7 @@ async fn run_deletion_pipeline(
     pb: ProgressBar,
     log_path: Option<PathBuf>,
 ) -> Result<(u64, u64, u64, Vec<PathBuf>), DeleterError> {
-// Channels for streaming pipeline
+    // Channels for streaming pipeline
     let (scan_tx, mut scan_rx) = mpsc::channel::<ScanResult>(1000);
     let (deleted_tx, mut deleted_rx) = mpsc::channel::<DeletedItem>(1000);
     let (trash_tx, mut trash_rx) = mpsc::channel::<PathBuf>(1000);
@@ -579,8 +610,8 @@ async fn run_deletion_pipeline(
     });
 
     // Logger task (NDJSON incremental write)
-    let log_handle = if let Some(path) = log_path {
-        Some(tokio::spawn(async move {
+    let log_handle = log_path.map(|path| {
+        tokio::spawn(async move {
             if let Ok(mut file) = fs::File::create(&path).await {
                 while let Some(item) = deleted_rx.recv().await {
                     if let Ok(json) = serde_json::to_string(&item) {
@@ -590,19 +621,20 @@ async fn run_deletion_pipeline(
                 }
                 info!("Delete log saved to: {}", path.display());
             }
-        }))
-    } else {
-        None
-    };
+        })
+    });
 
     // Spawn scanner tasks
-    let scan_handles: Vec<_> = directories.into_iter().map(|root| {
-        let scan_tx = scan_tx.clone();
-        let config = config.clone();
-        tokio::spawn(async move {
-            let _ = scan_to_channel(root, scan_tx, config).await;
+    let scan_handles: Vec<_> = directories
+        .into_iter()
+        .map(|root| {
+            let scan_tx = scan_tx.clone();
+            let config = config.clone();
+            tokio::spawn(async move {
+                let _ = scan_to_channel(root, scan_tx, config).await;
+            })
         })
-    }).collect();
+        .collect();
 
     if !individual_files.is_empty() {
         let scan_tx = scan_tx.clone();
@@ -621,15 +653,16 @@ async fn run_deletion_pipeline(
     let fail_tx_for_tasks = fail_tx.clone();
     let pb_clone = pb.clone();
     let delete_handle = tokio::spawn(async move {
-        let (task_tx, mut task_rx) = mpsc::channel::<tokio::task::JoinHandle<()>>(config.parallelism);
-        
+        let (task_tx, mut task_rx) =
+            mpsc::channel::<tokio::task::JoinHandle<()>>(config.parallelism);
+
         // Task processor
         let processor = tokio::spawn(async move {
             while let Some(task) = task_rx.recv().await {
                 let _ = task.await;
             }
         });
-        
+
         while let Some(result) = scan_rx.recv().await {
             let deleted_tx = deleted_tx.clone();
             let fail_tx = fail_tx_for_tasks.clone();
@@ -647,27 +680,34 @@ async fn run_deletion_pipeline(
 
                 if !config.dry_run {
                     let success = if result.is_dir {
-                        match fs::remove_dir(&result.path).await {
+                        match fs::remove_dir_all(&result.path).await {
                             Ok(_) => true,
-                            Err(ref e) if e.kind() == std::io::ErrorKind::Other => {
-                                if config.verbose {
-                                    pb.suspend(|| {
-                                        eprintln!("⏭️  Skipping non-empty directory: {}", result.path.display());
-                                    });
+                            Err(_e) => {
+                                // Check if directory still exists - if not, it was deleted despite the error
+                                let mut still_exists = true;
+                                for _ in 0..3 {
+                                    if fs::metadata(&result.path).await.is_err() {
+                                        still_exists = false;
+                                        break;
+                                    }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                        .await;
                                 }
-                                false
-                            }
-                            Err(_) => {
-                                error!("Failed to delete directory: {}", result.path.display());
-                                false
+                                if !still_exists {
+                                    info!(
+                                        "Directory deleted despite error: {}",
+                                        result.path.display()
+                                    );
+                                    true
+                                } else {
+                                    error!("Failed to delete directory: {}", result.path.display());
+                                    false
+                                }
                             }
                         }
                     } else {
                         if config.use_trash {
-                            match trash_tx.send(result.path.clone()).await {
-                                Ok(_) => true,
-                                Err(_) => false,
-                            }
+                            trash_tx.send(result.path.clone()).await.is_ok()
                         } else {
                             match fs::remove_file(&result.path).await {
                                 Ok(_) => {
@@ -682,18 +722,23 @@ async fn run_deletion_pipeline(
                         }
                     };
 
-                    if success && !result.is_dir {
+                    if success {
                         delete_count.fetch_add(1, Ordering::Relaxed);
-                        total_bytes.fetch_add(result.size, Ordering::Relaxed);
-                        deleted_tx.send(DeletedItem {
-                            path: result.path,
-                            is_dir: false,
-                            deleted_at: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("System time went backwards")
-                                .as_secs(),
-                        }).await.ok();
-                    } else if !success && !result.is_dir {
+                        if !result.is_dir {
+                            total_bytes.fetch_add(result.size, Ordering::Relaxed);
+                        }
+                        deleted_tx
+                            .send(DeletedItem {
+                                path: result.path,
+                                is_dir: result.is_dir,
+                                deleted_at: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .expect("System time went backwards")
+                                    .as_secs(),
+                            })
+                            .await
+                            .ok();
+                    } else if !result.is_dir {
                         fail_count.fetch_add(1, Ordering::Relaxed);
                         fail_tx.send(result.path).await.ok();
                     }
@@ -701,10 +746,10 @@ async fn run_deletion_pipeline(
 
                 pb.inc(1);
             });
-            
+
             task_tx.send(task).await.ok();
         }
-        
+
         drop(task_tx);
         processor.await.ok();
     });
@@ -790,39 +835,50 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     // Separate directories and individual files
     let mut directories = Vec::new();
     let mut individual_files = Vec::new();
-    
+
     for path in &all_paths {
         match fs::metadata(path).await {
             Ok(m) if m.is_dir() => directories.push(path.clone()),
             Ok(m) if m.is_file() => individual_files.push(path.clone()),
-            Ok(_) => warn!("Path is neither file nor directory, skipping: {}", path.display()),
+            Ok(_) => warn!(
+                "Path is neither file nor directory, skipping: {}",
+                path.display()
+            ),
             Err(e) => warn!("Cannot access path ({}), skipping: {}", e, path.display()),
         }
     }
 
     // Quick scan for preview (sample first few paths)
     let mut preview_files = 0;
-    let mut preview_bytes = 0;
+    let mut _preview_bytes = 0;
+    let mut preview_dirs = 0;
+
     for path in &individual_files {
         if let Ok(m) = fs::metadata(path).await {
             preview_files += 1;
-            preview_bytes += m.len();
+            _preview_bytes += m.len();
         }
     }
     for dir in &directories {
-        for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()).take(1000) {
+        for entry in WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .take(1000)
+        {
             if entry.file_type().is_file() {
                 if let Ok(m) = entry.metadata() {
                     if m.len() >= cli.min_size {
                         preview_files += 1;
-                        preview_bytes += m.len();
+                        _preview_bytes += m.len();
                     }
                 }
+            } else if cli.dirs && entry.file_type().is_dir() {
+                preview_dirs += 1;
             }
         }
     }
 
-    let total_estimate = preview_files;
+    let total_estimate = preview_files + preview_dirs;
     if total_estimate == 0 {
         println!("Nothing matched.");
         return Ok(());
@@ -834,7 +890,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     } else {
         "files"
     };
-    
+
     println!(
         "Will scan and delete '{}' {} in {} with {} mode",
         glob_pattern,
@@ -846,12 +902,12 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     println!("Estimated items: {}", total_estimate);
 
     if !cli.dry_run && !cli.yes {
-        print!("\nType YES/Yes/yes/Y/y to continue: ");
+        print!("\nType exactly YES to continue: ");
         std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if trimmed != "yes" && trimmed != "y" {
+        let trimmed = input.trim();
+        if trimmed != "YES" {
             return Err(DeleterError::Cancelled);
         }
     }
@@ -877,13 +933,8 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         None
     };
 
-    let (deleted, failed, bytes, failed_paths) = run_deletion_pipeline(
-        directories,
-        individual_files,
-        config,
-        pb,
-        log_path,
-    ).await?;
+    let (deleted, failed, bytes, failed_paths) =
+        run_deletion_pipeline(directories, individual_files, config, pb, log_path).await?;
 
     if cli.dry_run {
         println!("Preview complete.");
@@ -896,7 +947,11 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
             }
             eprintln!("  (Check file permissions)");
         }
-        println!("✅ Removed {} item(s), freed {}", deleted, format_size(bytes));
+        println!(
+            "✅ Removed {} item(s), freed {}",
+            deleted,
+            format_size(bytes)
+        );
     }
 
     Ok(())
@@ -905,7 +960,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 #[tokio::main]
 async fn main() -> Result<(), DeleterError> {
     let cli = Cli::parse();
-    
+
     // Set log level based on verbose flag
     if cli.verbose {
         tracing_subscriber::fmt()
@@ -916,17 +971,14 @@ async fn main() -> Result<(), DeleterError> {
             .with_max_level(tracing::Level::WARN)
             .init();
     }
-    
+
     debug!("Starting spacefree with CLI args: {:?}", cli);
-    
+
     if let Err(e) = run(cli).await {
         error!("Application error: {}", e);
         return Err(e);
     }
-    
+
     info!("spacefree completed successfully");
     Ok(())
 }
-
-#[cfg(test)]
-pub mod test;

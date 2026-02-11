@@ -30,6 +30,7 @@ tokio = { version = "1.49", features = [
     "macros",
     "sync",
     "io-util",
+    "time",
 ] }
 trash = "5.2"
 walkdir = "2.5"
