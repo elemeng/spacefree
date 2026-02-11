@@ -123,17 +123,20 @@ fn test_parse_paths_with_extra_whitespace() {
 // ========== build_globset tests ==========
 #[test]
 fn test_build_globset_simple() {
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     assert!(gs.is_match("file.txt"));
     assert!(gs.is_match("test.txt"));
     assert!(!gs.is_match("file.md"));
+    assert!(exclude.is_none());
 }
 
 #[test]
 fn test_build_globset_with_exclude() {
-    let gs = build_globset(Some("**/*.mrc"), &Some("**/*.txt".to_string())).unwrap();
+    let (gs, exclude) = build_globset(Some("**/*.mrc"), &Some("**/*.txt".to_string())).unwrap();
     assert!(gs.is_match("data/file.mrc"));
-    assert!(gs.is_match("file.txt")); // exclude pattern is also in the globset
+    assert!(!gs.is_match("file.txt")); // exclude pattern is now separate
+    assert!(exclude.is_some());
+    assert!(exclude.unwrap().is_match("file.txt"));
 }
 
 #[test]
@@ -232,9 +235,9 @@ fn test_cli_parse_all_options() {
 #[tokio::test]
 async fn test_scan_only_empty_dir() {
     let temp = TempDir::new().unwrap();
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, 0, 4)
+    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
         .await
         .unwrap();
 
@@ -258,9 +261,9 @@ async fn test_scan_only_with_files() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, 0, 4)
+    let (files, bytes, preview) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
         .await
         .unwrap();
 
@@ -280,11 +283,12 @@ async fn test_scan_only_with_min_size() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
     let (files, _bytes, _) = scan_only(
         vec![temp.path().to_path_buf()],
         gs,
+        exclude,
         10, // min_size
         4,
     )
@@ -302,11 +306,12 @@ async fn test_scan_only_multiple_dirs() {
     fs::write(temp1.path().join("a.txt"), "aaa").await.unwrap();
     fs::write(temp2.path().join("b.txt"), "bbbb").await.unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
     let (files, bytes, _) = scan_only(
         vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()],
         gs,
+        exclude,
         0,
         4,
     )
@@ -325,16 +330,18 @@ async fn test_delete_streaming_dry_run() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
     let deleted = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
+        exclude,
         true, // dry_run
         false,
         4,
         0,
+        false,
         pb,
     )
     .await
@@ -355,16 +362,18 @@ async fn test_delete_streaming_actual_delete() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
     let deleted = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
+        exclude,
         false, // actual delete
         false,
         4,
         0,
+        false,
         pb,
     )
     .await
@@ -383,16 +392,18 @@ async fn test_delete_streaming_with_min_size() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
     let pb = ProgressBar::hidden();
 
     let deleted = delete_streaming(
         vec![temp.path().to_path_buf()],
         gs,
+        exclude,
         false,
         false,
         4,
         5, // min_size
+        false,
         pb,
     )
     .await
@@ -506,9 +517,9 @@ async fn test_scan_only_returns_all_files() {
             .unwrap();
     }
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, _bytes, all_files) = scan_only(vec![temp.path().to_path_buf()], gs, 0, 4)
+    let (files, _bytes, all_files) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
         .await
         .unwrap();
 
@@ -520,9 +531,10 @@ async fn test_scan_only_returns_all_files() {
 // ========== globset exclude pattern tests ==========
 #[test]
 fn test_build_globset_exclude_matches() {
-    let gs = build_globset(Some("**/*.txt"), &Some("**/exclude*.txt".to_string())).unwrap();
+    let (gs, exclude) = build_globset(Some("**/*.txt"), &Some("**/exclude*.txt".to_string())).unwrap();
     assert!(gs.is_match("file.txt"));
-    assert!(gs.is_match("exclude_me.txt")); // patterns are ORed in GlobSet
+    assert!(gs.is_match("exclude_me.txt")); // still matches globset
+    assert!(exclude.unwrap().is_match("exclude_me.txt")); // but excluded separately
 }
 
 #[tokio::test]
@@ -539,9 +551,9 @@ async fn test_scan_only_with_glob_pattern() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
-    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, 0, 4)
+    let (files, _bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
         .await
         .unwrap();
 
@@ -766,9 +778,9 @@ async fn test_scan_only_nested_dirs() {
         .await
         .unwrap();
 
-    let gs = build_globset(Some("**/*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("**/*.txt"), &None).unwrap();
 
-    let (files, bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, 0, 4)
+    let (files, bytes, _) = scan_only(vec![temp.path().to_path_buf()], gs, exclude, 0, 4)
         .await
         .unwrap();
 
@@ -781,12 +793,13 @@ async fn test_scan_only_large_parallelism() {
     let temp = TempDir::new().unwrap();
     fs::write(temp.path().join("test.txt"), "x").await.unwrap();
 
-    let gs = build_globset(Some("*.txt"), &None).unwrap();
+    let (gs, exclude) = build_globset(Some("*.txt"), &None).unwrap();
 
     // Test with high parallelism value
     let (files, _, _) = scan_only(
         vec![temp.path().to_path_buf()],
         gs,
+        exclude,
         0,
         100, // high parallelism
     )

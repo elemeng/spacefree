@@ -151,19 +151,20 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| "size overflow".to_string())
 }
 
-fn build_globset(include: Option<&str>, exclude: &Option<String>) -> Result<GlobSet, DeleterError> {
+fn build_globset(include: Option<&str>, exclude: &Option<String>) -> Result<(GlobSet, Option<globset::GlobMatcher>), DeleterError> {
     let mut builder = GlobSetBuilder::new();
 
     let pattern = include.unwrap_or("**/*");
     builder.add(Glob::new(pattern).map_err(|e| DeleterError::Glob(e.to_string()))?);
 
-    if let Some(ex) = exclude {
-        builder.add(Glob::new(ex).map_err(|e| DeleterError::Glob(e.to_string()))?);
-    }
+    let globset = builder.build().map_err(|e| DeleterError::Glob(e.to_string()))?;
 
-    builder
-        .build()
-        .map_err(|e| DeleterError::Glob(e.to_string()))
+    let exclude_matcher = exclude
+        .as_ref()
+        .map(|ex| Glob::new(ex).map_err(|e| DeleterError::Glob(e.to_string())).map(|g| g.compile_matcher()))
+        .transpose()?;
+
+    Ok((globset, exclude_matcher))
 }
 
 fn format_dirs(paths: &[PathBuf]) -> String {
@@ -189,12 +190,14 @@ fn format_dirs(paths: &[PathBuf]) -> String {
 async fn scan_only(
     job_paths: Vec<PathBuf>,
     globset: GlobSet,
+    exclude_glob: Option<globset::GlobMatcher>,
     min_size: u64,
     parallelism: usize,
 ) -> Result<(u64, u64, Vec<PathBuf>), DeleterError> {
     let results = stream::iter(job_paths)
         .map(|root| {
             let globset = globset.clone();
+            let exclude_glob = exclude_glob.clone();
 
             tokio::task::spawn_blocking(move || {
                 let mut files = 0;
@@ -207,6 +210,11 @@ async fn scan_only(
                     }
                     if !globset.is_match(entry.path()) {
                         continue;
+                    }
+                    if let Some(ref exclude) = exclude_glob {
+                        if exclude.is_match(entry.path()) {
+                            continue;
+                        }
                     }
                     let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
                     if len < min_size {
@@ -248,6 +256,7 @@ async fn scan_only(
 async fn delete_streaming(
     roots: Vec<PathBuf>,
     globset: GlobSet,
+    exclude_glob: Option<globset::GlobMatcher>,
     dry_run: bool,
     use_trash: bool,
     parallelism: usize,
@@ -259,14 +268,24 @@ async fn delete_streaming(
 
     let stream = stream::iter(roots).flat_map(|root| {
         let globset = globset.clone();
+        let exclude_glob = exclude_glob.clone();
         stream::iter(
             WalkDir::new(root)
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(move |e| {
-                    e.file_type().is_file()
-                        && globset.is_match(e.path())
-                        && e.metadata().map(|m| m.len()).unwrap_or(0) >= min_size
+                    if !e.file_type().is_file() {
+                        return false;
+                    }
+                    if !globset.is_match(e.path()) {
+                        return false;
+                    }
+                    if let Some(ref exclude) = exclude_glob {
+                        if exclude.is_match(e.path()) {
+                            return false;
+                        }
+                    }
+                    e.metadata().map(|m| m.len()).unwrap_or(0) >= min_size
                 })
                 .map(|e| e.into_path()),
         )
@@ -369,13 +388,14 @@ async fn collect_paths(input_paths: &[PathBuf]) -> Result<Vec<PathBuf>, DeleterE
 
 async fn run(cli: Cli) -> Result<(), DeleterError> {
     let all_paths = collect_paths(&cli.paths).await?;
-    let globset = build_globset(cli.glob.as_deref(), &cli.exclude)?;
+    let (globset, exclude_glob) = build_globset(cli.glob.as_deref(), &cli.exclude)?;
 
     println!("🔍 Scanning...");
 
     let (files, bytes, preview) = scan_only(
         all_paths.clone(),
         globset.clone(),
+        exclude_glob.clone(),
         cli.min_size,
         cli.parallelism,
     )
@@ -428,6 +448,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     let deleted = delete_streaming(
         all_paths,
         globset,
+        exclude_glob,
         cli.dry_run,
         cli.trash,
         cli.parallelism,
@@ -451,3 +472,5 @@ async fn main() -> Result<(), DeleterError> {
     let cli = Cli::parse();
     run(cli).await
 }
+#[cfg(test)]
+pub mod test;
