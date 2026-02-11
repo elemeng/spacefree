@@ -1,6 +1,6 @@
 # 🚀 spacefree
 
-> ⚡High-performance file deletion tool with system trash support
+> ⚡ High-performance file deletion tool with trash support
 
 [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/) [![Crates.io](https://img.shields.io/crates/v/spacefree?style=for-the-badge)](https://crates.io/crates/spacefree) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
@@ -11,7 +11,7 @@
 | Feature | Description |
 |---------|-------------|
 | 🚀 **Blazing Fast** | Parallel scanning & deletion with configurable workers |
-| 🛡️ **Safe** | Optional trash mode (✅ Linux/macOS/Windows), dry-run preview |
+| 🛡️ **Safe** | Optional trash mode, dry-run preview, flexible confirmation |
 | 🎯 **Flexible** | Glob patterns, size filters, exclusion rules |
 | 📁 **Batch Ready** | Accept directories or path list files (CSV/TXT) |
 | 🧹 **Smart** | Automatically skips non-existent paths, deduplicates |
@@ -49,13 +49,16 @@ cargo install --path .
 ### Basic Usage
 
 ```bash
-# 🗑️  Delete files from job directories
+# 🗑️  Delete ALL files from directories (be careful!)
 $ spacefree J12 J13 J14
 
-# 👀 Preview before delete (dry run)
+# 👀 Preview before delete (dry run - recommended)
 $ spacefree J12 --dry-run
 
-# ♻️  Move to system trash (safer, recommended)
+# 🎯 Delete only specific file types
+$ spacefree J12 -g "*.log"
+
+# ♻️  Move to system trash (safer)
 $ spacefree J12 --trash
 ```
 
@@ -82,7 +85,9 @@ $ spacefree J12 --min-size 1G      # 1 gigabyte
 $ spacefree J12 --min-size 512k    # 512 kilobytes
 ```
 
-### Custom File Patterns
+### File Patterns (Glob)
+
+By default, **all files** are selected. Use `-g` to filter:
 
 ```bash
 # Delete only .log files
@@ -158,9 +163,20 @@ Options:
 ## ⚠️ Safety First
 
 1. **Always use `--dry-run` first** to preview what will be deleted
-2. **Use `--trash`** for safer deletion (can be recovered from system trash) ⚠️ **Recommended**
-3. **By default, deletion is PERMANENT** - files are not recoverable
-4. **Double-check your paths** before running without `--dry-run`
+2. **By default, ALL files are selected** - use `-g` to filter by pattern
+3. **Use `--trash`** for safer deletion (can be recovered from system trash)
+4. **By default, deletion is PERMANENT** - files are not recoverable
+5. **Double-check your paths** before running without `--dry-run`
+
+### Confirmation
+
+When deleting without `--yes`, you'll be prompted:
+
+```
+Type YES to continue:
+```
+
+Accepted responses: `YES`, `Yes`, `Y`, `y` (case insensitive)
 
 ---
 
