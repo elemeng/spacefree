@@ -203,7 +203,7 @@ When reporting bugs, please include:
 
 ## 📄 License
 
-MIT © [elemeng](https://github.com/elemeng/spacefree/LICENSE)
+MIT © [elemeng](https://github.com/elemeng/spacefree/blob/master/LICENSE)
 
 ---
 
