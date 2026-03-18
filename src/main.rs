@@ -87,6 +87,106 @@ impl LogMode {
     }
 }
 
+//
+// ──────────────────────────────────────────────────────────
+// Storage Type Detection (HDD vs SSD optimization)
+// ──────────────────────────────────────────────────────────
+//
+
+/// Storage device type for adaptive optimization
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StorageKind {
+    /// Hard disk drive - requires sequential access optimization
+    Hdd,
+    /// Solid state drive - can handle high parallelism
+    Ssd,
+    /// Unknown - default to SSD behavior
+    Unknown,
+}
+
+impl StorageKind {
+    /// Detect storage type from a path
+    fn from_path(path: &std::path::Path) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(kind) = Self::detect_linux(path) {
+                return kind;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(kind) = Self::detect_macos(path) {
+                return kind;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(kind) = Self::detect_windows(path) {
+                return kind;
+            }
+        }
+        StorageKind::Unknown
+    }
+
+    /// Linux: check /sys/block/*/queue/rotational
+    #[cfg(target_os = "linux")]
+    fn detect_linux(path: &std::path::Path) -> Option<StorageKind> {
+        use std::fs::read_to_string;
+        use std::os::unix::fs::MetadataExt;
+
+        // Get device ID
+        let metadata = std::fs::metadata(path).ok()?;
+        let _dev = metadata.dev();
+
+        // Try to find the block device
+        let sys_block = std::path::Path::new("/sys/block");
+        if let Ok(entries) = std::fs::read_dir(sys_block) {
+            for entry in entries.flatten() {
+                let rotational_path = entry.path().join("queue/rotational");
+                if let Ok(content) = read_to_string(&rotational_path) {
+                    let is_rotational = content.trim() == "1";
+                    return Some(if is_rotational {
+                        StorageKind::Hdd
+                    } else {
+                        StorageKind::Ssd
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// macOS: Use diskutil or check if it's an APFS SSD
+    #[cfg(target_os = "macos")]
+    fn detect_macos(_path: &std::path::Path) -> Option<StorageKind> {
+        // macOS detection would require IOKit or diskutil parsing
+        // For now, assume SSD on modern Macs
+        Some(StorageKind::Ssd)
+    }
+
+    /// Windows: Check DeviceSeekPenalty
+    #[cfg(target_os = "windows")]
+    fn detect_windows(_path: &std::path::Path) -> Option<StorageKind> {
+        // Windows detection would require WMI or DeviceIoControl
+        // For now, return Unknown to use default behavior
+        None
+    }
+
+    /// Get optimal parallelism for this storage type
+    fn optimal_parallelism(&self) -> usize {
+        match self {
+            StorageKind::Hdd => 1,           // Sequential for HDD
+            StorageKind::Ssd => num_cpus::get() * 4,  // High parallelism for SSD
+            StorageKind::Unknown => num_cpus::get() * 2, // Conservative default
+        }
+    }
+
+    /// Whether to use sorted ordering for optimal access
+    fn should_sort(&self) -> bool {
+        matches!(self, StorageKind::Hdd)
+    }
+}
+
 /// Generate next available log filename (spacefree_0001.log, spacefree_0002.log, etc.)
 /// Uses atomic create_new to avoid TOCTOU race conditions.
 fn generate_log_filename() -> PathBuf {
@@ -172,8 +272,8 @@ struct Cli {
     #[arg(long)]
     delete_root_dir: bool,
 
-    /// Number of parallel workers
-    #[arg(short, long, default_value_t = num_cpus::get() * 4, value_name = "N")]
+    /// Number of parallel workers (0 = auto-detect based on storage type)
+    #[arg(short, long, default_value_t = 0, value_name = "N")]
     parallelism: usize,
 
     /// Show all files to be deleted (verbose mode)
@@ -352,6 +452,8 @@ struct DeleteConfig {
     exclude_matcher: Option<GlobMatcher>,
     /// True if glob_pattern is "**/*" (matches all) - allows skipping glob check
     skip_glob_match: bool,
+    /// Storage type for adaptive optimization
+    storage_kind: StorageKind,
 }
 
 //
@@ -720,15 +822,37 @@ async fn run_deletion_pipeline(
         let delete_handle = tokio::spawn(async move {
             use futures::stream::{StreamExt, TryStreamExt};
     
-            let stream = async_stream::stream! {
+            // HDD optimization: collect and sort by path for sequential access
+            // SSD optimization: stream directly for high parallelism
+            use futures::stream::Stream;
+            let stream: std::pin::Pin<Box<dyn Stream<Item = ScanResult> + Send>> = if config.storage_kind.should_sort() {
+                // HDD: collect all, sort by path, then yield
+                let mut results: Vec<ScanResult> = Vec::new();
                 while let Some(result) = scan_rx.recv().await {
-                    // Check for shutdown request
                     if is_shutdown_requested() {
-                        info!("Shutdown requested, stopping deletion stream");
                         break;
                     }
-                    yield result;
+                    results.push(result);
                 }
+                // Sort by path for sequential disk access
+                results.sort_by(|a, b| a.path.cmp(&b.path));
+                Box::pin(async_stream::stream! {
+                    for result in results {
+                        yield result;
+                    }
+                })
+            } else {
+                // SSD: stream directly
+                Box::pin(async_stream::stream! {
+                    while let Some(result) = scan_rx.recv().await {
+                        // Check for shutdown request
+                        if is_shutdown_requested() {
+                            info!("Shutdown requested, stopping deletion stream");
+                            break;
+                        }
+                        yield result;
+                    }
+                })
             };
     
             stream
@@ -877,10 +1001,29 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     let glob_pattern = cli.glob.as_deref().unwrap_or("**/*").to_string();
 
+    // Detect storage type and set optimal parallelism
+    let (parallelism, storage_kind) = if cli.parallelism == 0 {
+        // Auto-detect based on storage type
+        let kind = all_paths
+            .first()
+            .map(|p| StorageKind::from_path(p))
+            .unwrap_or(StorageKind::Unknown);
+        let optimal = kind.optimal_parallelism();
+        println!("  Storage: {:?} → parallelism: {}", kind, optimal);
+        (optimal, kind)
+    } else {
+        // User-specified parallelism, still detect storage for sorting optimization
+        let kind = all_paths
+            .first()
+            .map(|p| StorageKind::from_path(p))
+            .unwrap_or(StorageKind::Unknown);
+        (cli.parallelism, kind)
+    };
+
     let config = Arc::new(DeleteConfig {
         use_trash: cli.trash,
         dry_run: cli.dry_run,
-        parallelism: cli.parallelism,
+        parallelism,
         min_size: cli.min_size,
         max_size: cli.max_size,
         min_age: cli.min_age,
@@ -892,6 +1035,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         glob_matcher: globset,
         exclude_matcher: exclude_glob,
         skip_glob_match: glob_pattern == "**/*",
+        storage_kind,
     });
 
     // Check for root directory and require explicit confirmation
