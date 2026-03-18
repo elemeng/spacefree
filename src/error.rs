@@ -16,7 +16,4 @@ pub enum DeleterError {
 
     #[error("Invalid glob: {0}")]
     Glob(String),
-
-    #[error("Progress bar error: {0}")]
-    ProgressBar(String),
 }
