@@ -50,10 +50,6 @@ storage-unknown = []
 tempfile = "3.10"
 
 [[bin]]
-name = "spf"
-path = "src/main.rs"
-
-[[bin]]
 name = "spacefree"
 path = "src/main.rs"
 
