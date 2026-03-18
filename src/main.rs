@@ -18,7 +18,7 @@ mod scan;
 mod storage;
 
 // Re-exports for convenience
-use cli::{build_globset, format_dirs, format_size, is_root_path, Cli};
+use cli::{Cli, build_globset, format_dirs, format_size, is_root_path};
 use config::DeleteConfig;
 use delete::run_deletion_pipeline;
 use error::DeleterError;
@@ -185,17 +185,15 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     println!("🗑️  Processing...");
 
     let log_mode = LogMode::from_opt(&cli.log);
-    let log_path = if cli.dry_run {
-        None
-    } else {
-        log_mode.path()
-    };
+    let log_path = if cli.dry_run { None } else { log_mode.path() };
 
     // Create progress bar
     let pb = ProgressBar::new(total_estimate as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .unwrap()
             .progress_chars("#>-"),
     );

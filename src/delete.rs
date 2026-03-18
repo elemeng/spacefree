@@ -5,12 +5,10 @@ use crate::scan::{scan_files_direct, scan_to_channel};
 use indicatif::ProgressBar;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
-use tokio::{
-    fs, io::AsyncWriteExt, sync::mpsc, task::spawn_blocking,
-};
+use tokio::{fs, io::AsyncWriteExt, sync::mpsc, task::spawn_blocking};
 use tracing::{debug, error, info};
 use trash::delete as trash_delete;
 

@@ -108,10 +108,7 @@ impl StorageKind {
     fn get_macos_mount_point(path: &std::path::Path) -> Option<String> {
         use std::process::Command;
 
-        let output = Command::new("df")
-            .arg(path)
-            .output()
-            .ok()?;
+        let output = Command::new("df").arg(path).output().ok()?;
 
         if !output.status.success() {
             return None;
