@@ -154,6 +154,10 @@ struct Cli {
     #[arg(long)]
     dirs: bool,
 
+    /// Do not follow symbolic links during directory traversal
+    #[arg(long)]
+    no_follow_symlinks: bool,
+
     /// Log deleted items to file (default: ./spacefree_0001.log)
     #[arg(short, long, value_name = "PATH")]
     log: Option<Option<PathBuf>>,
@@ -312,6 +316,7 @@ struct DeleteConfig {
     max_age: Option<u64>,
     verbose: bool,
     dirs: bool,
+    no_follow_symlinks: bool,
     glob_pattern: String,
     glob_matcher: GlobSet,
     exclude_matcher: Option<GlobMatcher>,
@@ -398,7 +403,7 @@ async fn collect_paths(
 async fn scan_to_channel(
     root: PathBuf,
     file_tx: mpsc::Sender<ScanResult>,
-    config: DeleteConfig,
+    config: Arc<DeleteConfig>,
 ) -> Result<(), DeleterError> {
     tokio::task::spawn_blocking(move || {
         let now = SystemTime::now()
@@ -408,7 +413,9 @@ async fn scan_to_channel(
 
         let mut scan_dirs = Vec::new();
 
-        for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+        let walkdir = WalkDir::new(&root)
+            .follow_links(!config.no_follow_symlinks);
+        for entry in walkdir.into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
 
             // Skip the root directory itself - we'll add it after WalkDir completes
@@ -517,7 +524,7 @@ async fn scan_to_channel(
 async fn scan_files_direct(
     paths: Vec<PathBuf>,
     file_tx: mpsc::Sender<ScanResult>,
-    config: DeleteConfig,
+    config: Arc<DeleteConfig>,
 ) -> Result<(), DeleterError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -586,7 +593,7 @@ async fn scan_files_direct(
 async fn run_deletion_pipeline(
     directories: Vec<PathBuf>,
     individual_files: Vec<PathBuf>,
-    config: DeleteConfig,
+    config: Arc<DeleteConfig>,
     pb: ProgressBar,
     log_path: Option<PathBuf>,
 ) -> Result<(u64, u64, u64, Vec<PathBuf>), DeleterError> {
@@ -829,7 +836,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     let glob_pattern = cli.glob.as_deref().unwrap_or("**/*").to_string();
 
-    let config = DeleteConfig {
+    let config = Arc::new(DeleteConfig {
         use_trash: cli.trash,
         dry_run: cli.dry_run,
         parallelism: cli.parallelism,
@@ -839,11 +846,12 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         max_age: cli.max_age,
         verbose: cli.verbose,
         dirs: cli.dirs,
+        no_follow_symlinks: cli.no_follow_symlinks,
         glob_pattern: glob_pattern.clone(),
         glob_matcher: globset,
         exclude_matcher: exclude_glob,
         skip_glob_match: glob_pattern == "**/*",
-    };
+    });
 
     // Check for root directory and require explicit confirmation
     for path in &all_paths {
@@ -898,7 +906,9 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         }
     }
     for dir in &directories {
-        for entry in WalkDir::new(dir)
+        let walkdir = WalkDir::new(dir)
+            .follow_links(!cli.no_follow_symlinks);
+        for entry in walkdir
             .into_iter()
             .filter_map(|e| e.ok())
             .take(1000)
