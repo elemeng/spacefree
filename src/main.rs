@@ -58,14 +58,26 @@ struct DeletedItem {
 }
 
 /// Generate next available log filename (spacefree_0001.log, spacefree_0002.log, etc.)
+/// Uses atomic create_new to avoid TOCTOU race conditions.
 fn generate_log_filename() -> PathBuf {
     let mut counter = 1;
     loop {
         let filename = format!("spacefree_{:04}.log", counter);
-        if !std::path::Path::new(&filename).exists() {
-            return PathBuf::from(filename);
+        let path = PathBuf::from(&filename);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return path,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                counter += 1;
+            }
+            Err(_) => {
+                // For other errors, try next filename
+                counter += 1;
+            }
         }
-        counter += 1;
     }
 }
 
@@ -269,6 +281,17 @@ fn format_dirs(paths: &[PathBuf]) -> String {
             format!("{}, and {}", rest.join(", "), last)
         }
     }
+}
+
+/// Check if a path points to a root directory.
+/// Uses canonicalization to handle symlinks.
+fn is_root_path(path: &std::path::Path) -> bool {
+    // Try to canonicalize to resolve symlinks
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    
+    // Check if the path has no parent (root has no parent)
+    // This works for both Unix (/) and Windows (C:\) after canonicalization
+    canonical.parent().is_none()
 }
 
 //
@@ -678,7 +701,7 @@ async fn run_deletion_pipeline(
                                 // Safe directory deletion: only delete if directory is empty
                                 // Never use remove_dir_all as it would ignore glob patterns
                                 let is_empty = match fs::read_dir(&result.path).await {
-                                    Ok(mut entries) => entries.next_entry().await.is_err(),
+                                    Ok(mut entries) => entries.next_entry().await.map(|e| e.is_none()).unwrap_or(false),
                                     Err(_) => false,
                                 };
                                 if is_empty {
@@ -714,7 +737,10 @@ async fn run_deletion_pipeline(
                                 }
                             } else {
                                 if config.use_trash {
-                                    trash_tx.send(result.path.clone()).await.is_ok()
+                                    // Queue for trash - actual success/failure counted by trash worker
+                                    let _ = trash_tx.send(result.path.clone()).await;
+                                    pb.inc(1);
+                                    return Ok::<(), ()>(());
                                 } else {
                                     match fs::remove_file(&result.path).await {
                                         Ok(_) => {
@@ -817,9 +843,9 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     // Check for root directory and require explicit confirmation
     for path in &all_paths {
-        if path.as_os_str() == "/" || path.as_os_str() == "" {
+        if is_root_path(path) {
             if !cli.delete_root_dir {
-                eprintln!("❌ ERROR: Attempting to delete root directory (/)");
+                eprintln!("❌ ERROR: Attempting to delete root directory");
                 eprintln!("This is extremely dangerous and could destroy your entire system.");
                 eprintln!();
                 eprintln!("To delete root directory, you must use BOTH:");
@@ -830,7 +856,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
                 return Err(DeleterError::Cancelled);
             }
             if !cli.yes {
-                eprintln!("❌ ERROR: Deleting root directory (/) requires -y flag");
+                eprintln!("❌ ERROR: Deleting root directory requires -y flag");
                 eprintln!();
                 eprintln!("You must use both:");
                 eprintln!("  -y (skip confirmation)");
