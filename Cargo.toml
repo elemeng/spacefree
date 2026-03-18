@@ -11,6 +11,7 @@ license = "MIT"
 keywords = ["cli", "delete", "trash", "cleanup", "files"]
 categories = ["command-line-utilities"]
 rust-version = "1.85"
+build = "build.rs"
 
 [dependencies]
 async-stream = "0.3"
@@ -37,8 +38,20 @@ tokio = { version = "1.49", features = [
 trash = "5.2"
 walkdir = "2.5"
 
+[features]
+default = []
+# Platform-specific features (auto-enabled by build.rs)
+storage-linux = []
+storage-macos = []
+storage-windows = []
+storage-unknown = []
+
 [dev-dependencies]
 tempfile = "3.10"
+
+[[bin]]
+name = "spf"
+path = "src/main.rs"
 
 [[bin]]
 name = "spacefree"
