@@ -428,11 +428,7 @@ async fn scan_to_channel(
                     }
                 }
 
-                if config.dirs {
-                    // When --dirs is enabled, skip individual files - directories will handle them
-                    continue;
-                }
-
+                // Check glob pattern for files (directories don't use glob when --dirs is enabled)
                 if !config.glob_matcher.is_match(path) {
                     continue;
                 }
@@ -573,8 +569,8 @@ async fn run_deletion_pipeline(
     let (scan_tx, mut scan_rx) = mpsc::channel::<ScanResult>(1000);
     let (deleted_tx, mut deleted_rx) = mpsc::channel::<DeletedItem>(1000);
     let (trash_tx, mut trash_rx) = mpsc::channel::<PathBuf>(1000);
-    let fail_tx = Arc::new(mpsc::channel::<PathBuf>(100).0);
-    let mut fail_rx = mpsc::channel::<PathBuf>(100).1;
+    let (fail_tx, mut fail_rx) = mpsc::channel::<PathBuf>(100);
+    let fail_tx = Arc::new(fail_tx);
 
     let deleted_count = Arc::new(AtomicU64::new(0));
     let failed_count = Arc::new(AtomicU64::new(0));
@@ -645,115 +641,127 @@ async fn run_deletion_pipeline(
     }
 
     drop(scan_tx);
-
-    // Delete consumer with limited concurrency
-    let delete_count = deleted_count.clone();
-    let fail_count = failed_count.clone();
-    let total_bytes = bytes_freed.clone();
-    let fail_tx_for_tasks = fail_tx.clone();
-    let pb_clone = pb.clone();
-    let delete_handle = tokio::spawn(async move {
-        let (task_tx, mut task_rx) =
-            mpsc::channel::<tokio::task::JoinHandle<()>>(config.parallelism);
-
-        // Task processor
-        let processor = tokio::spawn(async move {
-            while let Some(task) = task_rx.recv().await {
-                let _ = task.await;
-            }
-        });
-
-        while let Some(result) = scan_rx.recv().await {
-            let deleted_tx = deleted_tx.clone();
-            let fail_tx = fail_tx_for_tasks.clone();
-            let trash_tx = trash_tx.clone();
-            let pb = pb_clone.clone();
-            let config = config.clone();
-            let delete_count = delete_count.clone();
-            let fail_count = fail_count.clone();
-            let total_bytes = total_bytes.clone();
-
-            let task = tokio::spawn(async move {
-                if config.verbose {
-                    pb.println(result.path.display().to_string());
+    
+        // Delete consumer with proper concurrency control using for_each_concurrent
+        let delete_count = deleted_count.clone();
+        let fail_count = failed_count.clone();
+        let total_bytes = bytes_freed.clone();
+        let fail_tx_for_tasks = fail_tx.clone();
+        let pb_clone = pb.clone();
+        let delete_handle = tokio::spawn(async move {
+            use futures::stream::{StreamExt, TryStreamExt};
+    
+            let stream = async_stream::stream! {
+                while let Some(result) = scan_rx.recv().await {
+                    yield result;
                 }
-
-                if !config.dry_run {
-                    let success = if result.is_dir {
-                        match fs::remove_dir_all(&result.path).await {
-                            Ok(_) => true,
-                            Err(_e) => {
-                                // Check if directory still exists - if not, it was deleted despite the error
-                                let mut still_exists = true;
-                                for _ in 0..3 {
-                                    if fs::metadata(&result.path).await.is_err() {
-                                        still_exists = false;
-                                        break;
+            };
+    
+            stream
+                .map(|result| {
+                    let deleted_tx = deleted_tx.clone();
+                    let fail_tx = fail_tx_for_tasks.clone();
+                    let trash_tx = trash_tx.clone();
+                    let pb = pb_clone.clone();
+                    let config = config.clone();
+                    let delete_count = delete_count.clone();
+                    let fail_count = fail_count.clone();
+                    let total_bytes = total_bytes.clone();
+    
+                    async move {
+                        if config.verbose {
+                            pb.println(result.path.display().to_string());
+                        }
+    
+                        let success = if !config.dry_run {
+                            if result.is_dir {
+                                // Safe directory deletion: only delete if directory is empty
+                                // Never use remove_dir_all as it would ignore glob patterns
+                                let is_empty = match fs::read_dir(&result.path).await {
+                                    Ok(mut entries) => entries.next_entry().await.is_err(),
+                                    Err(_) => false,
+                                };
+                                if is_empty {
+                                    match fs::remove_dir(&result.path).await {
+                                        Ok(_) => true,
+                                        Err(_e) => {
+                                            // Check if directory still exists - if not, it was deleted despite the error
+                                            let mut still_exists = true;
+                                            for _ in 0..3 {
+                                                if fs::metadata(&result.path).await.is_err() {
+                                                    still_exists = false;
+                                                    break;
+                                                }
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                                    .await;
+                                            }
+                                            if !still_exists {
+                                                info!(
+                                                    "Directory deleted despite error: {}",
+                                                    result.path.display()
+                                                );
+                                                true
+                                            } else {
+                                                error!("Failed to delete directory: {}", result.path.display());
+                                                false
+                                            }
+                                        }
                                     }
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(10))
-                                        .await;
-                                }
-                                if !still_exists {
-                                    info!(
-                                        "Directory deleted despite error: {}",
-                                        result.path.display()
-                                    );
-                                    true
                                 } else {
-                                    error!("Failed to delete directory: {}", result.path.display());
+                                    // Directory not empty - skip it (files inside will be handled by their own scan entries)
+                                    debug!("Skipping non-empty directory: {}", result.path.display());
                                     false
                                 }
+                            } else {
+                                if config.use_trash {
+                                    trash_tx.send(result.path.clone()).await.is_ok()
+                                } else {
+                                    match fs::remove_file(&result.path).await {
+                                        Ok(_) => {
+                                            info!("Deleted: {}", result.path.display());
+                                            true
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to delete {}: {}", result.path.display(), e);
+                                            false
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    } else {
-                        if config.use_trash {
-                            trash_tx.send(result.path.clone()).await.is_ok()
                         } else {
-                            match fs::remove_file(&result.path).await {
-                                Ok(_) => {
-                                    info!("Deleted: {}", result.path.display());
-                                    true
-                                }
-                                Err(e) => {
-                                    error!("Failed to delete {}: {}", result.path.display(), e);
-                                    false
-                                }
+                            true  // Dry run: pretend everything succeeded
+                        };
+    
+                        if success {
+                            delete_count.fetch_add(1, Ordering::Relaxed);
+                            if !result.is_dir {
+                                total_bytes.fetch_add(result.size, Ordering::Relaxed);
                             }
+                            deleted_tx
+                                .send(DeletedItem {
+                                    path: result.path,
+                                    is_dir: result.is_dir,
+                                    deleted_at: SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .expect("System time went backwards")
+                                        .as_secs(),
+                                })
+                                .await
+                                .ok();
+                        } else if !result.is_dir {
+                            fail_count.fetch_add(1, Ordering::Relaxed);
+                            fail_tx.send(result.path).await.ok();
                         }
-                    };
-
-                    if success {
-                        delete_count.fetch_add(1, Ordering::Relaxed);
-                        if !result.is_dir {
-                            total_bytes.fetch_add(result.size, Ordering::Relaxed);
-                        }
-                        deleted_tx
-                            .send(DeletedItem {
-                                path: result.path,
-                                is_dir: result.is_dir,
-                                deleted_at: SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .expect("System time went backwards")
-                                    .as_secs(),
-                            })
-                            .await
-                            .ok();
-                    } else if !result.is_dir {
-                        fail_count.fetch_add(1, Ordering::Relaxed);
-                        fail_tx.send(result.path).await.ok();
+    
+                        pb.inc(1);
+                        Ok::<(), ()>(())
                     }
-                }
-
-                pb.inc(1);
-            });
-
-            task_tx.send(task).await.ok();
-        }
-
-        drop(task_tx);
-        processor.await.ok();
-    });
-
+                })
+                .buffer_unordered(config.parallelism)
+                .try_collect::<Vec<_>>()
+                .await
+                .ok();
+        });
     for handle in scan_handles {
         handle.await.ok();
     }

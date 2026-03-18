@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 rust-version = "1.85"
 
 [dependencies]
+async-stream = "0.3"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 globset = "0.4"
