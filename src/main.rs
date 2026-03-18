@@ -315,6 +315,8 @@ struct DeleteConfig {
     glob_pattern: String,
     glob_matcher: GlobSet,
     exclude_matcher: Option<GlobMatcher>,
+    /// True if glob_pattern is "**/*" (matches all) - allows skipping glob check
+    skip_glob_match: bool,
 }
 
 //
@@ -451,8 +453,8 @@ async fn scan_to_channel(
                     }
                 }
 
-                // Check glob pattern for files (directories don't use glob when --dirs is enabled)
-                if !config.glob_matcher.is_match(path) {
+                // Check glob pattern for files (skip if using default "**/*" pattern)
+                if !config.skip_glob_match && !config.glob_matcher.is_match(path) {
                     continue;
                 }
 
@@ -588,11 +590,12 @@ async fn run_deletion_pipeline(
     pb: ProgressBar,
     log_path: Option<PathBuf>,
 ) -> Result<(u64, u64, u64, Vec<PathBuf>), DeleterError> {
-    // Channels for streaming pipeline
-    let (scan_tx, mut scan_rx) = mpsc::channel::<ScanResult>(1000);
-    let (deleted_tx, mut deleted_rx) = mpsc::channel::<DeletedItem>(1000);
-    let (trash_tx, mut trash_rx) = mpsc::channel::<PathBuf>(1000);
-    let (fail_tx, mut fail_rx) = mpsc::channel::<PathBuf>(100);
+    // Channels for streaming pipeline - size tuned based on parallelism
+    let channel_capacity = (config.parallelism * 8).max(64);
+    let (scan_tx, mut scan_rx) = mpsc::channel::<ScanResult>(channel_capacity);
+    let (deleted_tx, mut deleted_rx) = mpsc::channel::<DeletedItem>(channel_capacity);
+    let (trash_tx, mut trash_rx) = mpsc::channel::<PathBuf>(channel_capacity);
+    let (fail_tx, mut fail_rx) = mpsc::channel::<PathBuf>((config.parallelism * 2).max(16));
     let fail_tx = Arc::new(fail_tx);
 
     let deleted_count = Arc::new(AtomicU64::new(0));
@@ -839,6 +842,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         glob_pattern: glob_pattern.clone(),
         glob_matcher: globset,
         exclude_matcher: exclude_glob,
+        skip_glob_match: glob_pattern == "**/*",
     };
 
     // Check for root directory and require explicit confirmation
