@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt, sync::mpsc, task::spawn_blocking};
+use tokio::{fs, io::AsyncWriteExt, signal, sync::mpsc, task::spawn_blocking};
 use tracing::{debug, error, info, warn};
 use trash::delete as trash_delete;
 use walkdir::WalkDir;
@@ -55,6 +55,36 @@ struct DeletedItem {
     path: PathBuf,
     is_dir: bool,
     deleted_at: u64,
+}
+
+/// Log mode for deletion operations
+enum LogMode {
+    /// No logging
+    Disabled,
+    /// Auto-generate log filename
+    Auto,
+    /// Use specific path
+    Path(PathBuf),
+}
+
+impl LogMode {
+    /// Parse log option from CLI string
+    fn from_opt(opt: &Option<String>) -> Self {
+        match opt {
+            None => LogMode::Disabled,
+            Some(s) if s == "auto" => LogMode::Auto,
+            Some(s) => LogMode::Path(PathBuf::from(s)),
+        }
+    }
+
+    /// Get the log path if logging is enabled
+    fn path(&self) -> Option<PathBuf> {
+        match self {
+            LogMode::Disabled => None,
+            LogMode::Auto => Some(generate_log_filename()),
+            LogMode::Path(p) => Some(p.clone()),
+        }
+    }
 }
 
 /// Generate next available log filename (spacefree_0001.log, spacefree_0002.log, etc.)
@@ -158,9 +188,9 @@ struct Cli {
     #[arg(long)]
     no_follow_symlinks: bool,
 
-    /// Log deleted items to file (default: ./spacefree_0001.log)
-    #[arg(short, long, value_name = "PATH")]
-    log: Option<Option<PathBuf>>,
+    /// Log deleted items to file (use without value for auto-named log, or specify path)
+    #[arg(short, long, value_name = "PATH", default_missing_value = "auto", num_args = 0..=1)]
+    log: Option<String>,
 }
 
 //
@@ -416,6 +446,12 @@ async fn scan_to_channel(
         let walkdir = WalkDir::new(&root)
             .follow_links(!config.no_follow_symlinks);
         for entry in walkdir.into_iter().filter_map(|e| e.ok()) {
+            // Check for shutdown request
+            if is_shutdown_requested() {
+                info!("Shutdown requested, stopping scan early");
+                break;
+            }
+
             let path = entry.path();
 
             // Skip the root directory itself - we'll add it after WalkDir completes
@@ -686,6 +722,11 @@ async fn run_deletion_pipeline(
     
             let stream = async_stream::stream! {
                 while let Some(result) = scan_rx.recv().await {
+                    // Check for shutdown request
+                    if is_shutdown_requested() {
+                        info!("Shutdown requested, stopping deletion stream");
+                        break;
+                    }
                     yield result;
                 }
             };
@@ -971,14 +1012,11 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
 
     println!("🗑️  Processing...");
 
-    let log_path = if !cli.dry_run && cli.log.is_some() {
-        if let Some(Some(p)) = cli.log.as_ref() {
-            Some(p.clone())
-        } else {
-            Some(generate_log_filename())
-        }
-    } else {
+    let log_mode = LogMode::from_opt(&cli.log);
+    let log_path = if cli.dry_run {
         None
+    } else {
+        log_mode.path()
     };
 
     let (deleted, failed, bytes, failed_paths) =
@@ -1005,6 +1043,14 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
     Ok(())
 }
 
+/// Global shutdown flag for graceful cancellation
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Check if shutdown has been requested
+fn is_shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DeleterError> {
     let cli = Cli::parse();
@@ -1019,6 +1065,16 @@ async fn main() -> Result<(), DeleterError> {
             .with_max_level(tracing::Level::WARN)
             .init();
     }
+
+    // Set up Ctrl+C handler for graceful shutdown
+    tokio::spawn(async move {
+        if let Err(e) = signal::ctrl_c().await {
+            warn!("Failed to listen for Ctrl+C: {}", e);
+            return;
+        }
+        println!("\n⚠️  Shutdown requested (Ctrl+C), finishing current operations...");
+        SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 
     debug!("Starting spacefree with CLI args: {:?}", cli);
 
