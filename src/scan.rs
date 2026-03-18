@@ -73,7 +73,7 @@ pub async fn scan_to_channel(
 
         let mut scan_dirs = Vec::new();
 
-        let walkdir = WalkDir::new(&root).follow_links(!config.no_follow_symlinks);
+        let walkdir = WalkDir::new(&root).follow_links(config.follow_symlinks);
         for entry in walkdir.into_iter().filter_map(|e| e.ok()) {
             // Check for shutdown request
             if crate::is_shutdown_requested() {

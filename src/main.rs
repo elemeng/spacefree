@@ -72,7 +72,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         max_age: cli.max_age,
         verbose: cli.verbose,
         dirs: cli.dirs,
-        no_follow_symlinks: cli.no_follow_symlinks,
+        follow_symlinks: cli.follow_symlinks,
         glob_pattern: glob_pattern.clone(),
         glob_matcher: globset,
         exclude_matcher: exclude_glob,
@@ -133,7 +133,7 @@ async fn run(cli: Cli) -> Result<(), DeleterError> {
         }
     }
     for dir in &directories {
-        let walkdir = WalkDir::new(dir).follow_links(!cli.no_follow_symlinks);
+        let walkdir = WalkDir::new(dir).follow_links(cli.follow_symlinks);
         for entry in walkdir.into_iter().filter_map(|e| e.ok()).take(1000) {
             if entry.file_type().is_file() {
                 if let Ok(m) = entry.metadata() {

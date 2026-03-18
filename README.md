@@ -143,8 +143,8 @@ $ spa J12 --dirs
 ### Safety Options
 
 ```bash
-# Don't follow symbolic links (prevents deleting outside target)
-$ spa J12 --no-follow-symlinks
+# Follow symbolic links (disabled by default for safety)
+$ spa J12 --follow-symlinks
 
 # Delete root directory (requires both flags for safety)
 $ spa /path --delete-root-dir -y
@@ -247,7 +247,7 @@ Options:
   -p, --parallelism <N>      Number of workers (0 = auto-detect) [default: 0]
   -v, --verbose              Show all files to be deleted
       --dirs                 Delete empty directories as well
-      --no-follow-symlinks   Don't follow symbolic links
+      --follow-symlinks      Follow symbolic links (disabled by default)
       --path-list-file <FILE>  File containing paths to process
   -l, --log [<PATH>]         Log deleted items (auto-named or specify path)
   -h, --help                 Print help
@@ -279,7 +279,7 @@ spacefree automatically detects your storage type and optimizes deletion strateg
 1. **Always use `--dry-run` first** to preview what will be deleted
 2. **By default, ALL files are selected** - use `-g` to filter by pattern
 3. **Use `--trash`** for safer deletion (can be recovered from system trash)
-4. **Symlink protection** - Use `--no-follow-symlinks` to prevent traversing outside target
+4. **Symlink protection** - Symbolic links are NOT followed by default (use `--follow-symlinks` to enable)
 5. **Root directory guard** - Requires both `--delete-root-dir` and `-y` to delete `/`
 6. **Graceful interruption** - Press Ctrl+C to stop safely after current operations
 7. **Empty directory check** - Directories only deleted when truly empty

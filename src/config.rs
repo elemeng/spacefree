@@ -15,7 +15,8 @@ pub struct DeleteConfig {
     pub max_age: Option<u64>,
     pub verbose: bool,
     pub dirs: bool,
-    pub no_follow_symlinks: bool,
+    /// Whether to follow symbolic links (disabled by default for safety)
+    pub follow_symlinks: bool,
     pub glob_pattern: String,
     pub glob_matcher: GlobSet,
     pub exclude_matcher: Option<GlobMatcher>,

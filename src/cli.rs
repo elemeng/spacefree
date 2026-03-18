@@ -71,9 +71,9 @@ pub struct Cli {
     #[arg(long)]
     pub dirs: bool,
 
-    /// Do not follow symbolic links during directory traversal
+    /// Follow symbolic links during directory traversal (disabled by default for safety)
     #[arg(long)]
-    pub no_follow_symlinks: bool,
+    pub follow_symlinks: bool,
 
     /// Log deleted items to file (use without value for auto-named log, or specify path)
     #[arg(short, long, value_name = "PATH", default_missing_value = "auto", num_args = 0..=1)]
